@@ -48,6 +48,7 @@ if [ "${XINCHAO_HOOK_READ_ONLY:-0}" != 1 ]; then
 fi
 
 # 2) 此刻块
+[ "${XINCHAO_HOOK_HEARTBEAT_ONLY:-0}" = 1 ] && exit 0
 [ -f "$STATE/off" ] && exit 0
 NOW_JSON=$(curl -s -H "Authorization: Bearer $TOKEN" --max-time 3 "$BASE/v1/now" 2>/dev/null) || exit 0
 [ -z "$NOW_JSON" ] && exit 0

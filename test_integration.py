@@ -190,6 +190,15 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNotNone(await send("e", parts))
                 self.assertIsNone(await send("f"))
                 self.assertIn(gateway.STATE_HEADING, await send("g", session="another"))
+                with patch.object(gateway, "MIND_STATE_MODE", "heartbeat-only"):
+                    before_heartbeat = len(paths)
+                    self.assertIsNone(await send("a"))  # Cached while injection was enabled.
+                    self.assertIsNone(await send("presence"))
+                    self.assertIsNone(await send("presence"))
+                    self.assertIsNone(await send("presence", continuation=True))
+                    self.assertIsNone(await send("cabin-only", notice))
+                    self.assertIsNone(await send("self-only", aru_wake_message(gateway.STATE_HEADING + "\n牵挂")))
+                    self.assertEqual(paths[before_heartbeat:], ["/v1/heartbeat"])
                 state["ok"], state["digest"] = False, "invalid"
                 self.assertIsNone(await send("h"))
                 state.update(ok=True, text=heading + "\ninvalid_state", lines=2)
@@ -501,8 +510,8 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                                 "reasoning_effort": "medium",
                                 "messages": [{"role": "user", "content": question}],
                             }
-                            for enabled in (True, False):
-                                with patch.object(gateway, "INJECT_MIND_STATE", enabled):
+                            for mode in ("1", "heartbeat-only", "0"):
+                                with patch.object(gateway, "MIND_STATE_MODE", mode):
                                     r = await phone.post(
                                         "/v1/chat/completions",
                                         json=payload,
@@ -512,7 +521,8 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                                         },
                                     )
                                 self.assertEqual(r.status_code, 200)
-                            enriched, plain = forwarded
+                            enriched, presence_only, plain = forwarded
+                            self.assertEqual(presence_only, payload["messages"])
                             self.assertEqual(plain, payload["messages"])
                             self.assertEqual(enriched[1:], plain)
                             self.assertEqual(enriched[0]["role"], "system")

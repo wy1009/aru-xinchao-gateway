@@ -35,7 +35,7 @@ THINKING_BUDGETS = {
 }
 ANALYSIS = os.environ.get("NIAN_ANALYSIS_URL", CHAT).rstrip("/")
 MIND = os.environ.get("NIAN_MIND_URL", "http://127.0.0.1:18110")
-INJECT_MIND_STATE = os.environ.get("NIAN_INJECT_MIND_STATE", "1") != "0"
+MIND_STATE_MODE = os.environ.get("NIAN_INJECT_MIND_STATE", "1")
 COLLABORATOR = os.environ.get("ARU_COLLABORATOR_NAME", "小禾")
 STATE_HEADING = f"【此刻，{COLLABORATOR}的状态】"
 CHAT_MEMORY_IMPORT = os.environ.get("NIAN_CHAT_MEMORY_IMPORT", "1") != "0"
@@ -303,6 +303,7 @@ def run_now_hook(directory, turn_id, head, *, read_only, continuation):
                     "XINCHAO_URL": MIND,
                     "XINCHAO_TOKEN": os.environ["NIAN_MIND_TOKEN"],
                     "XINCHAO_HOOK_STATE": str(directory),
+                    "XINCHAO_HOOK_HEARTBEAT_ONLY": "1" if MIND_STATE_MODE == "heartbeat-only" else "0",
                     "XINCHAO_HOOK_READ_ONLY": "1" if read_only else "0",
                 },
             )
@@ -375,6 +376,8 @@ async def add_state(messages, turn, scope):
         return
     wrapped = text.strip()
     cabin_notice = is_external_wake(wrapped) and wrapped[len(WAKE_PREFIX):].lstrip().startswith(("【小屋桥·", "我在心潮小屋"))
+    if MIND_STATE_MODE == "heartbeat-only" and (tail or cabin_notice):
+        return
     if is_bridge_message(text) and not cabin_notice:
         return
     try:
@@ -385,6 +388,8 @@ async def add_state(messages, turn, scope):
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         log.warning("Mind hook unavailable for a chat request")
         return
+    if MIND_STATE_MODE == "heartbeat-only":
+        return  # A replay can still have state text cached from before the mode changed.
     state = render_system_state(raw)
     if not state:
         return
@@ -628,7 +633,7 @@ async def chat(req: Request, *, organizer=False):
     db = req.app.state.db
     state_index = None
     user_index = turn[2] if turn else None
-    if turn and INJECT_MIND_STATE:
+    if turn and MIND_STATE_MODE != "0":
         state_index = await add_state(messages, turn, window_key(messages, turn))
         if state_index is not None:
             user_index = state_index + 1

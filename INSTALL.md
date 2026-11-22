@@ -20,6 +20,8 @@ node aru_wake/test.mjs
 3. 给网关进程创建专用可写的队列目录。在加载上述变量的环境中，从本项目根目录运行 `.venv/bin/uvicorn gateway:app --host 127.0.0.1 --port 18111 --no-access-log`。生产可用 `systemd/nian-gateway.service`，按实际目录、服务账号和虚拟环境路径调整。HTTPS 反向代理将 `/nian/` 前缀剥离后送往该端口，客户端填 `https://你的域名/nian/v1`。
 4. 将 `ARU_COLLABORATOR_NAME` 设为实际协作者名，网关和通知桥的环境都要设置这个变量，普通聊天和主动通知的状态标题会使用同一名字。备份导入另需 `ARU_COLLABORATOR_ID`，其值是原备份中 `collaborator.id`。请在网关、OB 和导入服务上使用同一组协作者设置。已有同步数据库绑定一位协作者，切换身份时使用独立的状态目录与 OB 库。
 
+若只希望通过主动唤醒收到心潮消息，在网关环境文件设 `NIAN_INJECT_MIND_STATE=heartbeat-only`，再重启网关。正常聊天只上报到场心跳。此设置也适用于新会话。默认值 `1` 会按官方节奏附加状态，`0` 关闭整个聊天前钩子。
+
 ## 可选组件
 
 - **备份上传页**使用 `aru_portal:app`。按 `systemd/aru-backup-*` 的服务路径将 `aru_*.py`、`aru_portal.html`、`wake_import.py` 和 `prompt_audit.py` 放入收件服务目录。创建独立的服务账号及上传密码，`INBOX_DIGEST` 是该密码的 SHA-256 摘要。常驻服务读取 `aru-backup-inbox.env`。在导入服务的 systemd drop-in 中加载含协作者设置的环境文件。导入和 AI 补全服务通过 `LoadCredential=gateway-internal` 取得与 OB 的 `NIAN_INTERNAL_TOKEN` 相同的凭据。反向代理向本机 19148 转发完整的 `/aru-backup` 路径。首次使用可先运行 `aru_backup.py 备份文件` 预览。
