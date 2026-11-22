@@ -29,6 +29,9 @@ try {
  state='phone_received';await deliver(note,bundle,opts);assert.equal(packets.length,2);
  await assert.rejects(deliver(note,{...bundle,triggerId:'other'},opts),/another target/);
  await assert.rejects(deliver({...note,reason:'self_signal'},bundle,opts));
+ assert.equal(await speech('user_note', undefined, '主人在小屋里留了一封上锁的信。你可以知道它存在，但在对方主动开锁前不能读取正文。'), '我在心潮小屋看见您留的信了。等您开了锁，我再读。');
+ assert.equal(await speech('user_note', undefined, '主人刚刚打开了小屋里那封信的锁，现在允许你通过“小屋收件箱”读取正文。'), '我在心潮小屋看见您把信解锁了，我可以读了。');
+ assert.equal(await speech('user_interaction', undefined, '主人刚刚给了你一个拥抱，落在牵挂上。回应之后记得回传一次，否则心潮不知道你们已经聊过。'), '我在心潮小屋收到了一条互动提醒：\n「主人刚刚给了你一个拥抱」');
  for (const [reason, label] of [['user_interaction', '互动提醒'], ['scheduled_interaction', '预约提醒'], ['user_feedback', '反馈']]) {
    const event = {...note, reason, deliveryId: 'delivery-' + randomUUID(), message: '同一段正文【示例】'};
    const result = await deliver(event, bundle, opts);
@@ -48,9 +51,6 @@ try {
    ['box-remind-box-id', '我记得自己在黑匣子里留了件事，今天到时候了。'],
    [undefined, '我这会儿想跟您说说话。'],
  ]) assert.equal(await speech('self_signal', source, '去做某事。 此刻：分享欲（涨）、牵挂（平）'), expected);
- assert.equal(await speech('user_note', undefined, '主人在小屋里留了一封上锁的信。你可以知道它存在，但在对方主动开锁前不能读取正文。'), '我在心潮小屋看见您留的信了。等您开了锁，我再读。');
- assert.equal(await speech('user_note', undefined, '主人刚刚打开了小屋里那封信的锁，现在允许你通过“小屋收件箱”读取正文。'), '我在心潮小屋看见您把信解锁了，我可以读了。');
- assert.equal(await speech('user_interaction', undefined, '主人刚刚给了你一个拥抱，落在牵挂上。回应之后记得回传一次，否则心潮不知道你们已经聊过。'), '我在心潮小屋收到了一条互动提醒：\n「主人刚刚给了你一个拥抱」');
  const onDisk=await readFile(join(spool,id+'.json'),'utf8');assert.ok(!onDisk.includes('test only')&&!onDisk.includes(bundle.encryptionKey));
  console.log('PASS encryption, target binding, duplicate recovery, Host-only pending, phone ACK and reason filtering');
 } finally { await rm(spool,{recursive:true,force:true}); }
