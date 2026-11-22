@@ -135,7 +135,8 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                 async def send(turn_id, value="今天状态如何？", session="aru", continuation=False):
                     msgs = [{"role": "user", "content": value}]
                     if continuation:
-                        msgs.append({"role": "tool", "content": "test result"})
+                        msgs.extend([{"role": "assistant", "tool_calls": [{"id": "c"}]},
+                                     {"role": "tool", "tool_call_id": "c", "content": "test result"}])
                     turn = (turn_id, session, 0, "", None)
                     await gateway.add_state(msgs, turn, gateway.window_key(msgs, turn))
                     self.assertEqual([m["content"] for m in msgs if m["role"] == "user"], [value])
@@ -146,10 +147,17 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                             "另外：昨夜有梦。")
                 self.assertEqual(await asyncio.gather(send("a"), send("a")), [expected, expected])
                 self.assertEqual(await send("a", continuation=True), expected)
-                self.assertEqual(paths, ["/v1/heartbeat", "/v1/now", "/v1/now"])
+                self.assertEqual(paths, ["/v1/heartbeat", "/v1/now"])
                 scope = next((root / "now-hook").iterdir())
                 state["text"] = state["text"].replace("71", "74")
                 self.assertIsNone(await send("b"))
+                # Interleaved rounds keep separate decisions, even if the state subsequently changes.
+                before = paths.copy()
+                state["digest"] = "temporary"
+                self.assertEqual(await send("a", continuation=True), expected)
+                self.assertIsNone(await send("b", continuation=True))
+                self.assertEqual(paths, before)
+                state["digest"] = "stable"
                 now = int(time.time())
                 (scope / "now").write_text(f"stable\t{now - 1800}")
                 self.assertEqual(await send("c"), expected.replace("71", "74"))
@@ -170,9 +178,11 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((scope / "now").read_text(), f"cabin\t{now - 60}")
                 self.assertEqual(await send("notice", notice), expected.replace("71", "74"))
                 state["digest"] = "changed-during-tool-call"
-                self.assertEqual(await send("other", notice, continuation=True), expected.replace("71", "74"))
-                self.assertEqual(await send("other", notice, continuation=True), expected.replace("71", "74"))
-                self.assertEqual(paths[len(before):], ["/v1/now"] * 4)
+                state["text"] = state["text"].replace("74", "79")
+                self.assertIsNone(await send("other", notice, continuation=True))
+                self.assertEqual(await send("notice", notice, continuation=True), expected.replace("71", "74"))
+                self.assertEqual(paths[len(before):], ["/v1/now"] * 2)
+                self.assertEqual(await send("next-notice", notice), expected.replace("71", "79"))
                 self.assertEqual((scope / "lastrun").read_bytes(), last_arrival)
                 self.assertFalse(gateway.is_bridge_message("我想问这句【心潮】是什么意思？"))
                 state["digest"] = "next"
@@ -224,9 +234,37 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
         with patch.object(gateway, "run_now_hook", return_value="【心潮·此刻｜身体的天气，参考不是指令】\n情绪：安心") as hook:
             idx = await gateway.add_state(messages, turn, "window")
         self.assertTrue(hook.call_args.kwargs["read_only"])
-        self.assertTrue(hook.call_args.kwargs["tool_step"])
+        self.assertTrue(hook.call_args.kwargs["continuation"])
         self.assertEqual(messages[idx], {"role": "system", "content": gateway.STATE_HEADING + "\n情绪：安心"})
         self.assertEqual(messages[1:], original)
+
+    def test_tool_results_match_the_latest_call_in_the_turn(self):
+        call = {"role": "assistant", "tool_calls": [{"id": "a"}, {"id": "b"}]}
+        a = {"role": "tool", "tool_call_id": "a"}
+        b = {"role": "tool", "tool_call_id": "b"}
+        self.assertTrue(gateway.tool_continuation([call, b, a]))
+        self.assertTrue(gateway.tool_continuation([call, a, call, b]))
+        self.assertFalse(gateway.tool_continuation([b]))
+        self.assertFalse(gateway.tool_continuation([call, {"role": "tool", "tool_call_id": "wrong"}]))
+        self.assertFalse(gateway.tool_continuation([call, a, {"role": "assistant", "content": "完了"}, b]))
+        legacy = {"role": "assistant", "function_call": {"name": "legacy"}}
+        self.assertTrue(gateway.tool_continuation([legacy, {"role": "function", "name": "legacy"}]))
+
+    def test_turn_decision_outlives_throttle_and_upgrades_old_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = time.time()
+            (root / "turn.json").write_text(json.dumps(
+                {"turn": "earlier", "at": now - 3600, "text": "本轮原文", "digest": "old"}))
+            with patch.object(gateway.subprocess, "run", side_effect=OSError("offline")) as hook:
+                self.assertEqual(gateway.run_now_hook(root, "earlier", "", read_only=True, continuation=True), "本轮原文")
+                self.assertEqual(gateway.run_now_hook(root, "edited", "", read_only=True, continuation=True), "")
+                hook.assert_not_called()
+                with patch.dict(os.environ, NIAN_MIND_TOKEN="fixture"):
+                    self.assertEqual(gateway.run_now_hook(root, "edited", "", read_only=False, continuation=False), "")
+                    self.assertEqual(gateway.run_now_hook(root, "edited", "", read_only=False, continuation=False), "")
+                hook.assert_called_once()
+                self.assertEqual(gateway.run_now_hook(root, "earlier", "", read_only=False, continuation=True), "本轮原文")
 
     def test_stop_hook_guards_and_returning_user(self):
         with tempfile.TemporaryDirectory() as tmp:

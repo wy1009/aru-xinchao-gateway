@@ -42,7 +42,7 @@ if [ "${XINCHAO_HOOK_READ_ONLY:-0}" != 1 ]; then
     PREV_RUN=$(cat "$STATE/lastrun" 2>/dev/null || echo 0)
     echo -n "$NOW_EPOCH" > "$STATE/lastrun"
     [ $((NOW_EPOCH - PREV_RUN)) -ge 5400 ] && ARRIVAL=1
-    # 只有人的消息触发到场心跳。外部通知和工具回执共享下方的状态去重。
+    # 只有人的消息触发到场心跳。小屋通知只读取状态。
     curl -s -X POST "$BASE/v1/heartbeat" -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
       -d "{\"event_id\":\"hb-$NOW_EPOCH-$$\"}" --max-time 4 >/dev/null 2>&1
 fi
@@ -61,15 +61,11 @@ except Exception: print("")' 2>/dev/null)
 [ -z "$DIGEST" ] && exit 0
 PREV_DIGEST=""; PREV_AT=0
 [ -f "$STATE/now" ] && { PREV_DIGEST=$(cut -f1 "$STATE/now"); PREV_AT=$(cut -f2 "$STATE/now"); }
-REPLAY=0
-if [ "$ARRIVAL" -eq 0 ] && [ "$DIGEST" = "$PREV_DIGEST" ] && [ $((NOW_EPOCH - PREV_AT)) -lt 1800 ]; then
-    [ "${XINCHAO_HOOK_REPLAY_DIGEST:-}" = "$DIGEST" ] || exit 0
-    REPLAY=1
-fi
+[ "$ARRIVAL" -eq 0 ] && [ "$DIGEST" = "$PREV_DIGEST" ] && [ $((NOW_EPOCH - PREV_AT)) -lt 1800 ] && exit 0
 TEXT=$(printf '%s' "$NOW_JSON" | python3 -c 'import sys,json
 try: print(json.load(sys.stdin).get("text",""))
 except Exception: print("")' 2>/dev/null)
 [ -z "$TEXT" ] && exit 0
-[ "$REPLAY" -eq 1 ] || printf '%s\t%s' "$DIGEST" "$NOW_EPOCH" > "$STATE/now"
+printf '%s\t%s' "$DIGEST" "$NOW_EPOCH" > "$STATE/now"
 printf '%s\n' "$TEXT"
 exit 0

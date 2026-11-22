@@ -279,45 +279,44 @@ def turn_identity(request, body, messages):
     )
 
 
-def run_now_hook(directory, turn_id, head, *, read_only=False, tool_step=None):
-    """Serialize the official hook's files and replay its decision on same-turn retries."""
+def run_now_hook(directory, turn_id, head, *, read_only, continuation):
+    """Decide once per turn revision, including an empty decision. Tools only replay it."""
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (directory / "lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        receipt = directory / ("tool.json" if tool_step else "turn.json")
-        last = json.loads(receipt.read_text()) if receipt.exists() else {}
+        receipt = directory / "turn.json"
+        recent = json.loads(receipt.read_text()) if receipt.exists() else {}
+        if isinstance(recent.get("turn"), str):  # Previous release stored only the first leg of the latest turn here.
+            recent = {recent["turn"]: {"at": recent["at"], "text": recent["text"]}}
         now = time.time()
-        if (last.get("turn") == turn_id and last.get("step") == tool_step
-                and now - last["at"] < 1800):
-            return last["text"]
-        # A tool call rebuilds the whole request from Aru history. Carry this
-        # turn's state forward only if the official hook confirms its digest.
-        replay_digest = ""
-        if tool_step:
-            first = directory / "turn.json"
-            for prior in (last, json.loads(first.read_text()) if first.exists() else {}):
-                if prior.get("turn") == turn_id and prior.get("digest") and now - prior["at"] < 1800:
-                    replay_digest = prior["digest"]
-                    break
-        result = subprocess.run(
-            ["bash", str(Path(__file__).with_name("xinchao-now-hook.sh"))],
-            input=json.dumps({"prompt": head}), text=True, capture_output=True,
-            check=True, timeout=10,
-            env={
-                "PATH": os.environ["PATH"],
-                "XINCHAO_HOOK_ENV_FILE": "/dev/null",
-                "XINCHAO_URL": MIND,
-                "XINCHAO_TOKEN": os.environ["NIAN_MIND_TOKEN"],
-                "XINCHAO_HOOK_STATE": str(directory),
-                "XINCHAO_HOOK_READ_ONLY": "1" if read_only else "0",
-                "XINCHAO_HOOK_REPLAY_DIGEST": replay_digest,
-            },
-        )
-        text = result.stdout.rstrip("\n")
+        cutoff = now - 7 * 86400
+        previous = recent.get(turn_id)
+        if previous is not None and previous["at"] >= cutoff:
+            return previous["text"]
+        if continuation:
+            return ""
+        try:
+            result = subprocess.run(
+                ["bash", str(Path(__file__).with_name("xinchao-now-hook.sh"))],
+                input=json.dumps({"prompt": head}), text=True, capture_output=True,
+                check=True, timeout=10,
+                env={
+                    "PATH": os.environ["PATH"],
+                    "XINCHAO_HOOK_ENV_FILE": "/dev/null",
+                    "XINCHAO_URL": MIND,
+                    "XINCHAO_TOKEN": os.environ["NIAN_MIND_TOKEN"],
+                    "XINCHAO_HOOK_STATE": str(directory),
+                    "XINCHAO_HOOK_READ_ONLY": "1" if read_only else "0",
+                },
+            )
+            text = result.stdout.rstrip("\n")
+        except (OSError, KeyError, subprocess.SubprocessError):
+            log.warning("Mind hook unavailable for a new turn")
+            text = ""
+        recent = {key: entry for key, entry in recent.items() if entry["at"] >= cutoff}
+        recent[turn_id] = {"at": now, "text": text}
         temp = receipt.with_suffix(".tmp")
-        digest = (directory / "now").read_text().split("\t", 1)[0] if text else ""
-        temp.write_text(json.dumps({"turn": turn_id, "step": tool_step, "at": now,
-                                    "text": text, "digest": digest}))
+        temp.write_text(json.dumps(recent, ensure_ascii=False))
         temp.replace(receipt)
         return text
 
@@ -342,6 +341,28 @@ def window_key(messages, turn):
     return transcript_hash("", "first-user", first.get("content"))
 
 
+def tool_continuation(tail):
+    """Match the trailing tool results to the assistant call that issued them."""
+    split = len(tail)
+    while split and tail[split - 1].get("role") in ("tool", "function"):
+        split -= 1
+    if not 0 < split < len(tail) or tail[split - 1].get("role") != "assistant":
+        return False
+    call = tail[split - 1]
+    replies = tail[split:]
+    if replies[0].get("role") == "function":
+        function = call.get("function_call")
+        name = function.get("name") if isinstance(function, dict) else None
+        return bool(name and len(replies) == 1 and replies[0].get("name") == name)
+    calls = call.get("tool_calls")
+    if not isinstance(calls, list):
+        return False
+    call_ids = {c["id"] for c in calls
+                if isinstance(c, dict) and isinstance(c.get("id"), str) and c["id"]}
+    return all(m.get("role") == "tool" and isinstance(m.get("tool_call_id"), str)
+               and m["tool_call_id"] in call_ids for m in replies)
+
+
 async def add_state(messages, turn, scope):
     turn_id, _, index, _, _ = turn
     msg = messages[index]
@@ -350,21 +371,16 @@ async def add_state(messages, turn, scope):
         return
     text = as_text(original)
     tail = [m for m in messages[index + 1:] if not is_aru_environment(m)]
-    tool_step = None
-    if tail:
-        if tail[-1].get("role") not in ("tool", "function"):
-            return
-        # Fingerprint the tool leg so a retry reuses exactly the same system block.
-        payload = json.dumps(tail, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        tool_step = hashlib.sha256(payload.encode()).hexdigest()
+    if tail and not tool_continuation(tail):
+        return
     wrapped = text.strip()
     cabin_notice = is_external_wake(wrapped) and wrapped[len(WAKE_PREFIX):].lstrip().startswith("【小屋桥·")
-    if is_bridge_message(text) and not (cabin_notice or tool_step):
+    if is_bridge_message(text) and not cabin_notice:
         return
     try:
         raw = await asyncio.to_thread(
             run_now_hook, DB.parent / "now-hook" / scope, turn_id, text.lstrip()[:1],
-            read_only=bool(cabin_notice or tool_step), tool_step=tool_step,
+            read_only=cabin_notice, continuation=bool(tail),
         )
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         log.warning("Mind hook unavailable for a chat request")
