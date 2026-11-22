@@ -1,3 +1,5 @@
+import { renderText } from './runtime/examples/render.mjs';
+
 // The upstream queue records what fired. The three drives in its "now" line are
 // a snapshot and can differ from the drive that actually triggered the notice.
 const driveSpeech = new Map(Object.entries({
@@ -40,23 +42,7 @@ function selfSpeech(sourceEventId = '') {
   return '我这会儿想跟您说说话。';
 }
 
-export function aruNotificationText({reason, message, sourceEventId}) {
-  if (reason === 'self_signal') return selfSpeech(sourceEventId);
-  const lead = '我在心潮小屋';
-  // These are the notices from the cabin API. A locked letter only announces its existence.
-  if (reason === 'user_note') {
-    if (message.endsWith('在小屋里留了一封上锁的信。你可以知道它存在，但在对方主动开锁前不能读取正文。'))
-      return lead + '看见您留的信了。等您开了锁，我再读。';
-    if (message.endsWith('刚刚打开了小屋里那封信的锁，现在允许你通过“小屋收件箱”读取正文。'))
-      return lead + '看见您把信解锁了，我可以读了。';
-    if (message.endsWith('在小屋里留了一封已经允许你阅读的信。请通过“小屋收件箱”读取。'))
-      return lead + '收到您的信了，我可以读了。';
-  }
-  if (reason === 'user_interaction') {
-    // The official interaction sentence appends affected dimensions and a reporting instruction.
-    const action = message.split(/，落在|。这份心意收到了，但今天|。回应之后记得回传一次/u, 1)[0].trim();
-    return lead + '收到了一条互动提醒：\n「' + action + '」';
-  }
-  const label = { user_note: '留言', scheduled_interaction: '预约提醒', user_feedback: '反馈' }[reason];
-  return lead + '收到了一条' + label + '：\n「' + message + '」';
+export function aruNotificationText(delivery) {
+  if (delivery.reason === 'self_signal') return selfSpeech(delivery.sourceEventId);
+  return renderText(delivery).replace('】', '｜心潮 MCP】');
 }
