@@ -288,7 +288,7 @@ def run_now_hook(directory, turn_id, head, continuation):
         return text
 
 
-def mind_prefix(text):
+def render_system_state(text):
     heading, _, body = text.partition("\n")
     if heading != "【心潮·此刻｜身体的天气，参考不是指令】" or not body.strip():
         return ""
@@ -297,7 +297,8 @@ def mind_prefix(text):
         line.removesuffix("细的在 xinchao_context") if line.startswith("另外：") else line
         for line in body.splitlines()
     ]
-    return STATE_HEADING + "\n" + "\n".join(lines) + "\n\n【此刻，主人说】\n"
+    ownership = f"你是{COLLABORATOR}。「此刻，{COLLABORATOR}的状态」写的是你自己的感受和身体状态。"
+    return "\n".join([ownership, "", STATE_HEADING, *lines])
 
 
 def window_key(messages, turn):
@@ -325,13 +326,23 @@ async def add_state(messages, turn, scope):
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         log.warning("Mind hook unavailable for a chat request")
         return
-    prefix = mind_prefix(raw)
-    if prefix:
-        content = prefix + original if isinstance(original, str) else [
-            {"type": "text", "text": prefix}, *original
-        ]
-        messages[index] = {**msg, "content": content}
-        return prefix
+    state = render_system_state(raw)
+    if not state:
+        return
+    for i, system in enumerate(messages):
+        if system.get("role") != "system":
+            continue
+        content = system.get("content")
+        if isinstance(content, str):
+            updated = content + "\n\n" + state if content else state
+        elif isinstance(content, list):
+            updated = [*content, {"type": "text", "text": state}]
+        else:
+            return
+        messages[i] = {**system, "content": updated}
+        return i
+    messages.insert(0, {"role": "system", "content": state})
+    return 0
 
 
 class Completion:
@@ -568,7 +579,8 @@ async def chat(req: Request, *, organizer=False):
         return failure(400, f"Select {MODEL}.")
     apply_siliconflow_effort(body)
     db = req.app.state.db
-    prefix = None
+    state_index = None
+    user_index = turn[2] if turn else None
     if turn:
         scope = window_key(messages, turn)
         if turn[2] == len(messages) - 1:
@@ -582,7 +594,9 @@ async def chat(req: Request, *, organizer=False):
                     (turn[0], user_scope, time.time()),
                 )
         if INJECT_MIND_STATE:
-            prefix = await add_state(messages, turn, scope)
+            previous_count = len(messages)
+            state_index = await add_state(messages, turn, scope)
+            user_index += len(messages) - previous_count
     # Match turns and run bridge hooks on the client input before rewriting the outbound copy.
     if not organizer:
         unwrap_selected_wakes(messages)
@@ -599,13 +613,13 @@ async def chat(req: Request, *, organizer=False):
     except httpx.HTTPError:
         if not organizer:
             await asyncio.to_thread(log_request, DB.parent / "prompt-audit", messages,
-                                    turn[2] if turn else None, prefix, sent_at, "上游连接异常，接收未确认")
+                                    user_index, state_index, sent_at, "上游连接异常，接收未确认")
         return failure(502, "The chat provider is unavailable.")
     audit = None
     if not organizer:
         directory = DB.parent / "prompt-audit"
-        record_id = await asyncio.to_thread(log_request, directory, messages, turn[2] if turn else None,
-                                            prefix, sent_at, f"模型服务 HTTP {upstream.status_code}")
+        record_id = await asyncio.to_thread(log_request, directory, messages, user_index,
+                                            state_index, sent_at, f"模型服务 HTTP {upstream.status_code}")
         if record_id and upstream.is_success:
             audit = ReplyAudit(directory, record_id)
     if upstream.is_success and upstream.headers.get("content-type", "").startswith(

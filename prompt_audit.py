@@ -33,7 +33,7 @@ def readable_content(message):
     return json.dumps(content, ensure_ascii=False, indent=2)
 
 
-def request_messages(messages, index, prefix):
+def request_messages(messages, index, state_index):
     entries = []
     for i, message in enumerate(messages):
         role = message.get("role")
@@ -46,7 +46,7 @@ def request_messages(messages, index, prefix):
             kind = "历史"
         else:
             kind = "本轮" if i == index else "本轮续接"
-        if i == index and prefix:
+        if i == state_index:
             kind += " · 网关已附加协作者状态"
         if message.get("name"):
             kind += " · " + str(message["name"])
@@ -94,10 +94,10 @@ def store(directory, record_id, when, status, entries):
                    (record_id, when, status, data))
 
 
-def log_request(directory, messages, index, prefix, sent_at, status):
+def log_request(directory, messages, index, state_index, sent_at, status):
     try:
         record_id = uuid.uuid4().hex
-        store(directory, record_id, sent_at, "对话 · " + status, request_messages(messages, index, prefix))
+        store(directory, record_id, sent_at, "对话 · " + status, request_messages(messages, index, state_index))
         return record_id
     except (OSError, sqlite3.Error, ValueError):
         logging.getLogger("uvicorn.error").warning("Xinchao request audit unavailable")

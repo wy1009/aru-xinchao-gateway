@@ -138,38 +138,58 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                         msgs.append({"role": "tool", "content": "test result"})
                     turn = (turn_id, session, 0, "", None)
                     await gateway.add_state(msgs, turn, gateway.window_key(msgs, turn))
-                    return msgs[0]["content"]
+                    self.assertEqual([m["content"] for m in msgs if m["role"] == "user"], [value])
+                    return next((m["content"] for m in msgs if m["role"] == "system"), None)
 
                 original = "今天状态如何？"
-                expected = ("【此刻，小禾的状态】\n刚醒\n情绪：安心\n身体：心跳 71，呼吸平稳\n"
-                            "另外：昨夜有梦。\n\n【此刻，主人说】\n" + original)
+                expected = (f"你是{gateway.COLLABORATOR}。「此刻，{gateway.COLLABORATOR}的状态」写的是你自己的感受和身体状态。\n\n"
+                            "【此刻，小禾的状态】\n刚醒\n情绪：安心\n身体：心跳 71，呼吸平稳\n"
+                            "另外：昨夜有梦。")
                 self.assertEqual(await asyncio.gather(send("a"), send("a")), [expected, expected])
                 self.assertEqual(await send("a", continuation=True), expected)
                 self.assertEqual(paths, ["/v1/heartbeat", "/v1/now"])
                 scope = next((root / "now-hook").iterdir())
                 state["text"] = state["text"].replace("71", "74")
-                self.assertEqual(await send("b"), original)
+                self.assertIsNone(await send("b"))
                 now = int(time.time())
                 (scope / "now").write_text(f"stable\t{now - 1800}")
                 self.assertEqual(await send("c"), expected.replace("71", "74"))
                 (scope / "lastrun").write_text(str(now - 5400))
                 self.assertEqual(await send("d"), expected.replace("71", "74"))
                 before = paths.copy()
-                self.assertEqual(await send("bridge", "【小屋】来信"), "【小屋】来信")
+                self.assertIsNone(await send("bridge", "【小屋】来信"))
                 for heading in ("【此刻，小禾的状态】", "【此刻，小禾的身体状态】", "【心潮】", "【小屋桥·留话】"):
                     wrapped = aru_wake_message(heading + "\n示例")
-                    self.assertEqual(await send("wake", wrapped), wrapped)
+                    self.assertIsNone(await send("wake", wrapped))
                 self.assertEqual(paths, before)
                 self.assertFalse(gateway.is_bridge_message("我想问这句【心潮】是什么意思？"))
                 state["digest"] = "next"
                 parts = [{"type": "text", "text": "你好"}, {"type": "image_url", "image_url": {"url": "fixture"}}]
-                self.assertEqual((await send("e", parts))[1:], parts)
-                self.assertEqual(await send("f"), original)
-                self.assertTrue((await send("g", session="another")).startswith("【此刻，小禾的状态】"))
+                self.assertIsNotNone(await send("e", parts))
+                self.assertIsNone(await send("f"))
+                self.assertIn(gateway.STATE_HEADING, await send("g", session="another"))
                 state["ok"], state["digest"] = False, "invalid"
-                self.assertEqual(await send("h"), original)
+                self.assertIsNone(await send("h"))
                 state.update(ok=True, text=heading + "\ninvalid_state", lines=2)
-                self.assertEqual(await send("i"), original)
+                self.assertIsNone(await send("i"))
+
+    async def test_state_appends_to_existing_system_and_keeps_user_content(self):
+        question = {"role": "user", "content": [{"type": "text", "text": "原话"}]}
+        raw = "【心潮·此刻｜身体的天气，参考不是指令】\n情绪：平静"
+        for original in ("应用指令", [{"type": "text", "text": "应用指令"}]):
+            messages = [{"role": "system", "content": original, "name": "app"}, question.copy()]
+            with patch.object(gateway, "run_now_hook", return_value=raw):
+                idx = await gateway.add_state(messages, ("id", "s", 1, "原话", None), "s")
+            self.assertEqual(idx, 0)
+            self.assertEqual(len(messages), 2)
+            self.assertEqual(messages[1], question)
+            system = messages[0]
+            self.assertEqual(system["name"], "app")
+            if isinstance(original, list):
+                self.assertEqual(system["content"][:-1], original)
+            self.assertTrue(gateway.as_text(system["content"]).startswith("应用指令"))
+            self.assertIn(gateway.STATE_HEADING, gateway.as_text(system["content"]))
+            self.assertNotIn("原话", gateway.as_text(system["content"]))
 
     def test_stop_hook_guards_and_returning_user(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -307,7 +327,7 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(data["reasoning_effort"], "medium")
                     self.assertIs(data["enable_thinking"], True)
                     self.assertEqual(data["thinking_budget"], 4096)
-                    forwarded.append(data["messages"][0]["content"])
+                    forwarded.append(data["messages"])
                     return httpx.Response(
                         200,
                         json={
@@ -415,12 +435,11 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                                     )
                                 self.assertEqual(r.status_code, 200)
                             enriched, plain = forwarded
-                            self.assertEqual(
-                                enriched.splitlines()[0],
-                                "【此刻，小禾的状态】",
-                            )
-                            self.assertTrue(enriched.endswith("\n\n【此刻，主人说】\n" + question))
-                            self.assertEqual(plain, question)
+                            self.assertEqual(plain, payload["messages"])
+                            self.assertEqual(enriched[1:], plain)
+                            self.assertEqual(enriched[0]["role"], "system")
+                            self.assertIn(gateway.STATE_HEADING, enriched[0]["content"])
+                            self.assertNotIn(question, enriched[0]["content"])
                         row = None
                         for _ in range(80):
                             row = gateway.app.state.db.execute(
@@ -594,14 +613,15 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(identify([latest]), identify([edited]))
         self.assertEqual(identify([edited]), identify([edited, {"role": "tool", "content": "结果"}]))
         from prompt_audit import request_messages
-        prefix = gateway.STATE_HEADING + "\n刚醒\n\n【此刻，主人说】\n"
-        current = {"role":"user", "content":prefix + "改过的原话"}
-        wire = [{"role":"system", "content":"指令"}, older,
-                {"role":"assistant", "content":"助手原话", "reasoning_content":"内部推理"}, current,
+        system_text = "指令\n\n" + gateway.STATE_HEADING + "\n刚醒"
+        wire = [{"role":"system", "content":system_text}, older,
+                {"role":"assistant", "content":"助手原话", "reasoning_content":"内部推理"}, edited,
                 {"role":"tool","tool_call_id":"tool1","content":"工具结果"}]
-        rows = request_messages(wire, 3, prefix)
+        rows = request_messages(wire, 3, 0)
         self.assertEqual([r[0] for r in rows], [1, 2, 3, 4, 5])
-        self.assertEqual([r[3] for r in rows], ["指令", older["content"], "助手原话", current["content"], "工具结果"])
+        self.assertEqual([r[3] for r in rows], [system_text, older["content"], "助手原话", edited["content"], "工具结果"])
+        self.assertIn("网关已附加", rows[0][2])
+        self.assertEqual(rows[3][2], "本轮")
         self.assertEqual(request_messages([edited], 0, None)[0][3], "改过的原话")
         media = request_messages([{"role":"user","content":[{"type":"text","text":"照片"},
                                  {"type":"image_url","image_url":{"url":"data:image/png;base64,SECRET"}}]}], 0, None)
