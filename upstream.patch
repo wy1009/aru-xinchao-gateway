@@ -117,14 +117,27 @@
 +    const fingerprint = auditEventFingerprint(event.eventId ?? event.event_id);
 +    if (snapshot.recentConversationEvents?.some(item => item?.eventFingerprint === fingerprint)) return { skipped: 'duplicate' };
 +  }
-+  if (!interactionClassificationDue(snapshot)) return { skipped: 'throttled' };
++  if (!supplied && !interactionClassificationDue(snapshot)) return { skipped: 'throttled' };
    try {
 -    const raw = await model.classifyInteraction(exchange);
 +    const raw = supplied ? normalizeInteraction(supplied) : await model.classifyInteraction(exchange);
      if (!raw) return null;
      const { her } = splitExchange(exchange);
      const nowMs = Date.now();
-@@ -1573,6 +1583,9 @@
+@@ -1027,7 +1037,11 @@
+       (current) => ({ ...current, interactionClassifyAt: new Date().toISOString() }));
+     log('interaction_classified', { type: tag.type, tone: tag.tone, source, ...(tag.sub ? { sub: tag.sub } : {}), ...(tag.guarded ? { guarded: tag.guarded } : {}) });
+     return { type: tag.type, tone: tag.tone, ...(tag.sub ? { sub: tag.sub } : {}), ...(tag.guarded ? { guarded: tag.guarded } : {}) };
+-  } catch (error) { log('interaction_classify_failed', { message: error.message }); return null; }
++  } catch (error) {
++    log('interaction_classify_failed', { message: error.message });
++    if (supplied) throw error;
++    return null;
++  }
+ }
+ 
+ async function recordConversationEvent(event, source = 'api', now = new Date()) {
+@@ -1573,6 +1587,9 @@
        return payload ? send(response, 200, payload) : send(response, 404, { error: 'not found' });
      }
  
@@ -134,7 +147,7 @@
      if (request.method === 'GET' && url.pathname === '/v1/state') {
        return send(response, 200, await store.read());
      }
-@@ -1726,7 +1739,7 @@
+@@ -1726,7 +1743,7 @@
    }
  });
  

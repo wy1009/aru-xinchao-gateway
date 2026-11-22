@@ -272,44 +272,35 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                 hook.assert_called_once()
                 self.assertEqual(gateway.run_now_hook(root, "earlier", "", read_only=False, continuation=True), "本轮原文")
 
-    def test_stop_hook_guards_and_returning_user(self):
+    async def test_each_turn_compares_to_last_acknowledged_result_per_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "queue.sqlite"
-            db = sqlite3.connect(path)
-            self.addCleanup(db.close)
-            gateway.setup_queue(db)
-            start = 20_000
-
-            def arrive(turn, window, when):
-                with db:
-                    db.execute("INSERT INTO tag_receipts(turn,window,user_at) VALUES(?,?,?)",
-                               (turn, window, when))
-
-            def send(turn, minutes, question="你好"):
-                return gateway.reserve_stop_tag(db, turn, question, start + 60 * minutes)
-
-            arrive("away", "returning-window", start - 3600)
-            self.assertTrue(send("first", 0))
-            self.assertTrue(send("first", 1))  # Same delivery can retry without taking a new slot.
-            self.assertFalse(send("too-soon", 7.99))
-            for minute in (8, 16, 24):
-                self.assertTrue(send(str(minute), minute))
-            self.assertFalse(send("hourly", 32))
-            arrive("long-away", "returning-window", start + 32 * 60)
-            self.assertTrue(send("long-away", 32))  # Return can bypass the hourly cap.
-            arrive("recent-return", "returning-window", start + 33 * 60)
-            self.assertFalse(send("recent-return", 33))
-            self.assertFalse(send("bridge", 90, "  【小屋桥·留话】"))
-            self.assertFalse(send("aru-wake", 90, aru_wake_message("【此刻，小禾的状态】\n刚醒。")))
-            arrive("too-old", "fresh", start)
-            self.assertFalse(send("too-old", 45.01))
-            arrive("no-visible-text", None, start + 90 * 60)
-            self.assertFalse(send("no-visible-text", 90, "［用户附上图片］"))
-            again = sqlite3.connect(path)
-            self.addCleanup(again.close)
-            self.assertFalse(gateway.reserve_stop_tag(again, "after-restart", "你好", start + 40 * 60))
-            self.assertTrue(send("next-hour", 68))
-            self.assertEqual(db.execute("SELECT count(sent_at) FROM tag_receipts").fetchone()[0], 6)
+            db = self.queue(path)
+            posted = []
+            async def route(req):
+                self.assertTrue(req.url.path.endswith("/conversation-event"))
+                posted.append(json.loads(req.content))
+                return httpx.Response(200, json={"classified": {"type": "sharing"}})
+            tags = [{"type": "sharing", "tone": tone, "warmth": warmth}
+                    for tone, warmth in (("warm", 0.7), ("warm", 0.7), ("warm", 0.8),
+                                         ("calm", 0.8), ("warm", 0.7), ("warm", 0.7), ("warm", 0.7))]
+            tags[1]["sub"] = None  # Equivalent to a missing optional field.
+            with patch.dict(os.environ, NIAN_MIND_TOKEN="fixture"), patch.object(
+                    gateway, "model_json", new_callable=AsyncMock, side_effect=tags) as classify:
+                async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+                    for i in range(8):
+                        if i == 5:
+                            db.close()
+                            db = self.queue(path)
+                        app = SimpleNamespace(state=SimpleNamespace(db=db, client=client))
+                        session = "another" if i == 6 else "room"
+                        question = aru_wake_message("通知") if i == 7 else f"问题{i}"
+                        gateway.enqueue(db, str(i), session, question, f"答复{i}")
+                        row = db.execute("SELECT * FROM turns WHERE id=?", (str(i),)).fetchone()
+                        await gateway.process_turn(app, row)
+            self.assertEqual([c.args[3] for c in classify.await_args_list],
+                             [f"她说：问题{i}\n他回：答复{i}" for i in range(7)])
+            self.assertEqual([e["event_id"] for e in posted], ["0", "2", "3", "4", "6"])
 
     async def test_turn_and_idempotent_ob_delivery(self):
         with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
@@ -433,6 +424,9 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(
                             user, "她说：" + question + "\n他回：我知道了。"
                         )
+                    elif user.startswith("她说：冷却中的问题"):
+                        self.assertTrue(user.startswith("她说：冷却中的问题\n他回：回答"))
+                        self.assertEqual(len(user), 8000)
                     else:
                         self.assertEqual(len(user), 8000)
                         self.assertTrue(
@@ -441,7 +435,7 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue(user.endswith("收尾"))
                         self.assertIn("［中间已省略］", user)
                         self.assertNotIn(question, user)
-                    result = classification
+                    result = {**classification, "tone": "focused"} if user.startswith("她说：到期的这一轮") else classification
                     calls.append("emotion")
                 else:
                     self.assertEqual(system, gateway.ob_import.IMPORT_EXTRACT_PROMPT)
@@ -573,7 +567,7 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                             await asyncio.sleep(0.1)
                         self.assertEqual(
                             (buffered["state"], buffered["mind_done"], len(calls)),
-                            ("buffered", 1, 2),
+                            ("buffered", 1, 3),
                         )
                         state_path = root / "state.json"
                         state = json.loads(state_path.read_text())
@@ -582,20 +576,6 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                             state["interactionClassifyAt"],
                             actual["interactionClassifyAt"],
                         )
-                        # Move the isolated classifier timestamp across the native eight-minute boundary.
-                        from datetime import datetime, timezone
-
-                        for age, expected in ((450, False), (481, True)):
-                            state["interactionClassifyAt"] = datetime.fromtimestamp(
-                                time.time() - age, timezone.utc
-                            ).isoformat()
-                            state_path.write_text(json.dumps(state))
-                            self.assertEqual(
-                                (await private.get(due_url, headers=headers)).json()[
-                                    "due"
-                                ],
-                                expected,
-                            )
                         duplicate = await private.post(
                             mind_url + "/v1/conversation-event",
                             headers=headers,
@@ -606,11 +586,7 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                             },
                         )
                         self.assertEqual(duplicate.status_code, 200)
-                        self.assertTrue(
-                            (await private.get(due_url, headers=headers)).json()["due"]
-                        )
-                        with db:
-                            db.execute("UPDATE tag_receipts SET sent_at=sent_at-481 WHERE sent_at IS NOT NULL")
+                        self.assertTrue(duplicate.json()["duplicate"])
                         gateway.enqueue(
                             db,
                             "c" * 64,
@@ -629,7 +605,10 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                                 break
                             await asyncio.sleep(0.1)
                         self.assertEqual(statuses, ["done", "buffered", "buffered"])
-                        self.assertEqual(calls, ["emotion", "memory", "emotion"])
+                        self.assertEqual(calls.count("emotion"), 3)
+                        self.assertEqual(calls.count("memory"), 1)
+                        events = json.loads(state_path.read_text())["recentConversationEvents"]
+                        self.assertEqual([e.get("interactionType") for e in events], [None, "sharing", "sharing"])
                         self.assertFalse(
                             (await private.get(due_url, headers=headers)).json()["due"]
                         )
@@ -862,11 +841,11 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
         calls = []
 
         def route(req):
-            if req.url.path.endswith("/due"):
-                calls.append("unavailable")
-                return httpx.Response(503)
             if req.url.path.endswith("/chat/completions"):
                 data = json.loads(req.content)
+                if data["messages"][0]["content"] == gateway.INTERACTION_PROMPT:
+                    calls.append("unavailable")
+                    return httpx.Response(503)
                 self.assertEqual(
                     data["messages"][0]["content"],
                     gateway.ob_import.IMPORT_EXTRACT_PROMPT,
@@ -928,9 +907,6 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
         calls = []
 
         def route(req):
-            if req.url.path.endswith("/due"):
-                calls.append("preflight")
-                return httpx.Response(200, json={"due": True})
             if req.url.path.endswith("/chat/completions"):
                 calls.append("emotion")
                 data = json.loads(req.content)
@@ -950,7 +926,7 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertTrue(req.url.path.endswith("/conversation-event"))
             calls.append("mind")
-            return httpx.Response(503 if calls.count("mind") == 1 else 200, json={})
+            return httpx.Response(503 if calls.count("mind") == 1 else 200, json={"duplicate": True})
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
             app = SimpleNamespace(state=SimpleNamespace(db=db, client=client))
@@ -967,7 +943,7 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                 await gateway.process_turn(
                     app, db.execute("SELECT * FROM turns").fetchone()
                 )
-            self.assertEqual(calls, ["preflight", "emotion", "mind", "mind"])
+            self.assertEqual(calls, ["emotion", "mind", "mind"])
             self.assertEqual(
                 tuple(
                     db.execute(
@@ -1005,12 +981,10 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
         calls = []
 
         async def route(req):
-            if req.url.path.endswith("/due"):
-                return httpx.Response(200, json={"due": True})
             body = json.loads(req.content)
             if req.url.path.endswith("/conversation-event"):
                 calls.append("event")
-                return httpx.Response(200, json={})
+                return httpx.Response(200, json={"classified": {"type": "sharing"}})
             self.assertTrue(req.url.path.endswith("/chat/completions"))
             prompt, user = (m["content"] for m in body["messages"])
             if prompt == gateway.ob_import.IMPORT_EXTRACT_PROMPT:

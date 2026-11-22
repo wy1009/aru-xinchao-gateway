@@ -67,9 +67,6 @@ ob_import = load_ob_import()
 INTERACTION_PROMPT = load_interaction_prompt()
 EMOTION_CHAR_LIMIT = 8000
 EMOTION_REPLY_RESERVE = 1000
-TAG_GAP_SECONDS = 60 * float(os.environ.get("XINCHAO_TAG_GAP_MIN", "8"))
-TAG_HOURLY_MAX = int(os.environ.get("XINCHAO_TAG_HOURLY_MAX", "4"))
-TAG_ARRIVAL_SECONDS = 60 * float(os.environ.get("XINCHAO_TAG_ARRIVAL_MIN", "45"))
 MEMORY_TARGET_TOKENS = 2 * ob_import._CHUNK_TARGET_TOKENS
 MEMORY_CHAR_LIMIT = 2 * ob_import._EXTRACT_INPUT_LIMIT
 
@@ -628,22 +625,10 @@ async def chat(req: Request, *, organizer=False):
     db = req.app.state.db
     state_index = None
     user_index = turn[2] if turn else None
-    if turn:
-        scope = window_key(messages, turn)
-        if all(is_aru_environment(m) for m in messages[turn[2] + 1:]):
-            # Aru has no Claude transcript timestamps. Capture the first receipt, before
-            # the model runs, so long generations and queued replies age correctly.
-            user_words = as_text(messages[turn[2]].get("content")).strip()
-            user_scope = scope if user_words and not is_bridge_message(user_words) else None
-            with db:
-                db.execute(
-                    "INSERT OR IGNORE INTO tag_receipts(turn, window, user_at) VALUES(?,?,?)",
-                    (turn[0], user_scope, time.time()),
-                )
-        if INJECT_MIND_STATE:
-            state_index = await add_state(messages, turn, scope)
-            if state_index is not None:
-                user_index = state_index + 1
+    if turn and INJECT_MIND_STATE:
+        state_index = await add_state(messages, turn, window_key(messages, turn))
+        if state_index is not None:
+            user_index = state_index + 1
     # Match turns and run bridge hooks on the client input before rewriting the outbound copy.
     if not organizer:
         unwrap_selected_wakes(messages)
@@ -767,38 +752,27 @@ def emotion_exchange(question, answer):
     )
 
 
-def reserve_stop_tag(db, turn, question, now):
-    """Apply the official Stop hook's sending rules before the server-side cooldown."""
-    if not question.strip() or is_bridge_message(question):
-        return False
-    with db:
-        # The write also serializes concurrent decisions and preserves a retry's slot.
-        db.execute("INSERT OR IGNORE INTO tag_receipts(turn) VALUES(?)", (turn,))
-        window, user_at, sent_at = db.execute(
-            "SELECT window,user_at,sent_at FROM tag_receipts WHERE turn=?", (turn,)
-        ).fetchone()
-        if user_at is not None and (window is None or now - user_at > 45 * 60):
-            return False
-        if sent_at is not None:
-            return True
-        previous = db.execute(
-            "SELECT MAX(user_at) FROM tag_receipts WHERE window=? AND user_at<?",
-            (window, user_at),
-        ).fetchone()[0]
-        returning = previous is not None and user_at - previous >= TAG_ARRIVAL_SECONDS
-        if not returning:
-            count, latest = db.execute(
-                "SELECT COUNT(*), MAX(sent_at) FROM tag_receipts WHERE sent_at>?",
-                (now - 3600,),
-            ).fetchone()
-            if count >= TAG_HOURLY_MAX or (latest is not None and now - latest < TAG_GAP_SECONDS):
-                return False
-        db.execute("UPDATE tag_receipts SET sent_at=? WHERE turn=?", (now, turn))
-        return True
+def normalized_interaction(tag):
+    """Use the same field defaults, enums and numeric ranges as Xinchao."""
+    if not isinstance(tag, dict) or not isinstance(tag.get("type"), str):
+        raise AnalysisFormatError("invalid interaction")
+    module = (UPSTREAM / "xinchao/src/model-client.js").as_uri()
+    script = (
+        "import {readFileSync} from 'node:fs';"
+        "const {normalizeInteraction}=await import(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(normalizeInteraction(JSON.parse(readFileSync(0,'utf8')))));"
+    )
+    return subprocess.check_output(
+        ["node", "--input-type=module", "-e", script, module],
+        input=json.dumps(tag, ensure_ascii=False), text=True, timeout=10,
+    )
 
 
-def finish_mind_turn(db, turn):
+def finish_mind_turn(db, turn, *, session=None, reported=None):
     with db:
+        if reported is not None:
+            db.execute("INSERT INTO emotion_reports(session,result) VALUES(?,?) "
+                       "ON CONFLICT(session) DO UPDATE SET result=excluded.result", (session, reported))
         db.execute(
             "UPDATE turns SET mind_done=1,state='buffered',mode=NULL,result=NULL,error=NULL WHERE id=?",
             (turn,),
@@ -808,49 +782,38 @@ def finish_mind_turn(db, turn):
 
 async def process_turn(app, row):
     db, client = app.state.db, app.state.client
-    turn, mode = row["id"], row["mode"]
-    headers = bearer(os.environ["NIAN_MIND_TOKEN"])
-    if mode is None:
-        if not reserve_stop_tag(db, turn, row["question"], time.time()):
-            finish_mind_turn(db, turn)
-            return
-        r = await client.get(
-            MIND + "/v1/interaction-classification/due", headers=headers
-        )
-        r.raise_for_status()
-        due = r.json()["due"]
-        if not isinstance(due, bool):
-            raise ValueError("invalid classification status")
-        mode = "classify" if due else "presence"
-        save(db, "UPDATE turns SET mode=? WHERE id=?", mode, turn)
-    event = {"event_id": turn, "session_id": row["session"]}
-    if mode == "classify":
-        exchange = "她说：" + row["question"] + "\n他回：" + row["answer"]
-        if row["result"] is None:
-            tag = await model_json(
-                client,
-                "emotion-" + turn,
-                INTERACTION_PROMPT,
-                emotion_exchange(row["question"], row["answer"]),
-                256,
-                object_output=True,
-            )
-            if not isinstance(tag, dict) or not isinstance(tag.get("type"), str):
-                raise AnalysisFormatError("invalid interaction")
-            save(
-                db,
-                "UPDATE turns SET result=?,failures=0 WHERE id=?",
-                json.dumps(tag, ensure_ascii=False),
-                turn,
-            )
-        else:
-            tag = json.loads(row["result"])
-        event.update(exchange=exchange, gateway_classification=tag)
+    turn, session = row["id"], row["session"]
+    if not row["question"].strip() or is_bridge_message(row["question"]):
+        finish_mind_turn(db, turn)
+        return
+    exchange = emotion_exchange(row["question"], row["answer"])
+    if row["result"] is None:
+        tag = await model_json(client, "emotion-" + turn, INTERACTION_PROMPT, exchange,
+                               256, object_output=True)
+        encoded = await asyncio.to_thread(normalized_interaction, tag)
+        save(db, "UPDATE turns SET mode='report',result=?,failures=0 WHERE id=?", encoded, turn)
+    elif row["mode"] == "report":
+        encoded = row["result"]
     else:
-        event["her_words"] = row["question"][:80]
-    r = await client.post(MIND + "/v1/conversation-event", headers=headers, json=event)
+        # A pending classification written by the previous release can be delivered as-is.
+        encoded = await asyncio.to_thread(normalized_interaction, json.loads(row["result"]))
+        save(db, "UPDATE turns SET mode='report',result=? WHERE id=?", encoded, turn)
+
+    previous = db.execute("SELECT result FROM emotion_reports WHERE session=?", (session,)).fetchone()
+    if previous is not None and previous[0] == encoded:
+        finish_mind_turn(db, turn)
+        return
+
+    event = {"event_id": turn, "session_id": session, "exchange": exchange,
+             "gateway_classification": json.loads(encoded)}
+    r = await client.post(MIND + "/v1/conversation-event",
+                          headers=bearer(os.environ["NIAN_MIND_TOKEN"]), json=event)
     r.raise_for_status()
-    finish_mind_turn(db, turn)
+    receipt = r.json()
+    if not (receipt.get("classified", {}).get("type") or receipt.get("duplicate") is True):
+        raise ValueError("Mind did not acknowledge the classification")
+    # Advance the baseline and complete the turn in the same transaction.
+    finish_mind_turn(db, turn, session=session, reported=encoded)
 
 
 def memory_candidates(db, tip):
@@ -1094,10 +1057,8 @@ def setup_queue(db):
             request_hash TEXT NOT NULL, output_hash TEXT NOT NULL, model TEXT NOT NULL,
             output TEXT NOT NULL, saved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(request_hash, output_hash))""")
-        db.execute("""CREATE TABLE IF NOT EXISTS tag_receipts(
-            turn TEXT PRIMARY KEY, window TEXT, user_at REAL, sent_at REAL)""")
-        db.execute("CREATE INDEX IF NOT EXISTS tag_window_time ON tag_receipts(window,user_at)")
-        db.execute("CREATE INDEX IF NOT EXISTS tag_sent_time ON tag_receipts(sent_at) WHERE sent_at IS NOT NULL")
+        db.execute("""CREATE TABLE IF NOT EXISTS emotion_reports(
+            session TEXT PRIMARY KEY, result TEXT NOT NULL)""")
         columns = {r[1] for r in db.execute("PRAGMA table_info(turns)")}
         additions = {
             "group_id": "TEXT",
