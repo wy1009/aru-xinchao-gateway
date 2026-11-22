@@ -170,7 +170,7 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(await send("wake", wrapped))
                 self.assertEqual(paths, before + ["/v1/now"])
                 state["digest"] = "cabin"
-                notice = aru_wake_message("【小屋桥·留话｜心潮 MCP】\n有来信")
+                notice = aru_wake_message("我在心潮小屋收到您的信了，我可以读了。")
                 last_arrival = (scope / "lastrun").read_bytes()
                 self.assertEqual(await send("notice", notice), expected.replace("71", "74"))
                 (scope / "now").write_text(f"cabin\t{now - 60}")

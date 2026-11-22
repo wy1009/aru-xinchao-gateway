@@ -664,3 +664,13 @@
          ].join(''),
        }),
      };
+--- a/xinchao/src/bridge-queue.js
++++ b/xinchao/src/bridge-queue.js
+@@ -108,6 +108,7 @@
+       protocol: BRIDGE_RUNTIME_PROTOCOL,
+       deliveryId: item.id,
+       reason: item.reason,
++      ...(item.reason === 'self_signal' ? { sourceEventId: item.eventId } : {}),
+       message: item.message,
+     };
+   }

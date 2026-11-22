@@ -371,7 +371,7 @@ async def add_state(messages, turn, scope):
     if tail and not tool_continuation(tail):
         return
     wrapped = text.strip()
-    cabin_notice = is_external_wake(wrapped) and wrapped[len(WAKE_PREFIX):].lstrip().startswith("【小屋桥·")
+    cabin_notice = is_external_wake(wrapped) and wrapped[len(WAKE_PREFIX):].lstrip().startswith(("【小屋桥·", "我在心潮小屋"))
     if is_bridge_message(text) and not cabin_notice:
         return
     try:

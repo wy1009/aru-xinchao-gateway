@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { parseRuntimeEnvelope } from './runtime/src/protocol.js';
-import { renderText } from './runtime/examples/render.mjs';
+import { aruNotificationText } from './notification.mjs';
 import { sealWakeEvent } from './aru/wake-send.mjs';
 
 const digest = (value, format = 'hex') => createHash('sha256').update(value).digest(format);
@@ -21,13 +21,6 @@ function receipt(query) {
     sock.once('error', reject);
     sock.once('end', () => resolve(reply.trim()));
   });
-}
-
-function aruNotificationText(delivery) {
-  if (delivery.reason !== 'self_signal') {
-    return renderText(delivery).replace('】', '｜心潮 MCP】');
-  }
-  return '【此刻，' + (process.env.ARU_COLLABORATOR_NAME || '小禾') + '的状态】\n' + delivery.message;
 }
 
 async function savedEnvelope(file, bundle, delivery, eventId, target) {

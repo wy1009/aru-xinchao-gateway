@@ -82,6 +82,8 @@ export function parseRuntimeEnvelope(value, expectedDeliveryId = null, { acceptS
     protocol: RUNTIME_PROTOCOL,
     deliveryId: value.deliveryId,
     reason: value.reason,
+    ...(value.reason === SELF_SIGNAL_REASON && typeof value.sourceEventId === 'string'
+      ? { sourceEventId: value.sourceEventId.slice(0, 120) } : {}),
     message: value.message,
   });
 }
