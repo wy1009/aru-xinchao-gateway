@@ -388,20 +388,8 @@ async def add_state(messages, turn, scope):
     state = render_system_state(raw)
     if not state:
         return
-    for i, system in enumerate(messages):
-        if system.get("role") != "system":
-            continue
-        content = system.get("content")
-        if isinstance(content, str):
-            updated = content + "\n\n" + state if content else state
-        elif isinstance(content, list):
-            updated = [*content, {"type": "text", "text": state}]
-        else:
-            return
-        messages[i] = {**system, "content": updated}
-        return i
-    messages.insert(0, {"role": "system", "content": state})
-    return 0
+    messages.insert(index, {"role": "system", "content": state})
+    return index
 
 
 class Completion:
@@ -653,9 +641,9 @@ async def chat(req: Request, *, organizer=False):
                     (turn[0], user_scope, time.time()),
                 )
         if INJECT_MIND_STATE:
-            previous_count = len(messages)
             state_index = await add_state(messages, turn, scope)
-            user_index += len(messages) - previous_count
+            if state_index is not None:
+                user_index = state_index + 1
     # Match turns and run bridge hooks on the client input before rewriting the outbound copy.
     if not organizer:
         unwrap_selected_wakes(messages)

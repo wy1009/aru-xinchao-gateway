@@ -195,23 +195,23 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                 state.update(ok=True, text=heading + "\ninvalid_state", lines=2)
                 self.assertIsNone(await send("i"))
 
-    async def test_state_appends_to_existing_system_and_keeps_user_content(self):
+    async def test_state_keeps_client_prefix_and_precedes_current_user(self):
+        environment = {"role": "user", "content": "<environment>\naru.feature_slice: x\n</environment>"}
         question = {"role": "user", "content": [{"type": "text", "text": "原话"}]}
+        history = [{"role": "user", "content": "前文"}, {"role": "assistant", "content": "上一条答复"}]
         raw = "【心潮·此刻｜身体的天气，参考不是指令】\n情绪：平静"
-        for original in ("应用指令", [{"type": "text", "text": "应用指令"}]):
-            messages = [{"role": "system", "content": original, "name": "app"}, question.copy()]
+        for original in (None, "应用指令", [{"type": "text", "text": "应用指令"}]):
+            prefix = [] if original is None else [{"role": "system", "content": original, "name": "app"}]
+            prefix.extend([*history, environment])
+            messages = [*prefix, question]
+            prefix_bytes = json.dumps(prefix, ensure_ascii=False)
+            turn = gateway.turn_identity(SimpleNamespace(headers={}), {}, messages)
             with patch.object(gateway, "run_now_hook", return_value=raw):
-                idx = await gateway.add_state(messages, ("id", "s", 1, "原话", None), "s")
-            self.assertEqual(idx, 0)
-            self.assertEqual(len(messages), 2)
-            self.assertEqual(messages[1], question)
-            system = messages[0]
-            self.assertEqual(system["name"], "app")
-            if isinstance(original, list):
-                self.assertEqual(system["content"][:-1], original)
-            self.assertTrue(gateway.as_text(system["content"]).startswith("应用指令"))
-            self.assertIn(gateway.STATE_HEADING, gateway.as_text(system["content"]))
-            self.assertNotIn("原话", gateway.as_text(system["content"]))
+                index = await gateway.add_state(messages, turn, "s")
+            self.assertEqual(index, len(prefix))
+            self.assertEqual(json.dumps(messages[:index], ensure_ascii=False), prefix_bytes)
+            self.assertEqual(messages[index:], [
+                {"role": "system", "content": gateway.STATE_HEADING + "\n情绪：平静"}, question])
 
     async def test_aru_read_letter_with_transient_environment(self):
         request = SimpleNamespace(headers={})
@@ -236,7 +236,13 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(hook.call_args.kwargs["read_only"])
         self.assertTrue(hook.call_args.kwargs["continuation"])
         self.assertEqual(messages[idx], {"role": "system", "content": gateway.STATE_HEADING + "\n情绪：安心"})
-        self.assertEqual(messages[1:], original)
+        self.assertEqual(idx, turn[2])
+        self.assertEqual(messages[:idx], original[:idx])
+        self.assertEqual(messages[idx + 1:], original[idx:])
+        from prompt_audit import request_messages
+        rows = request_messages(messages, idx + 1, idx)
+        self.assertIn("网关已附加", rows[idx][2])
+        self.assertEqual(rows[idx + 1][2], "本轮")
 
     def test_tool_results_match_the_latest_call_in_the_turn(self):
         call = {"role": "assistant", "tool_calls": [{"id": "a"}, {"id": "b"}]}
