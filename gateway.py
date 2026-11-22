@@ -297,8 +297,7 @@ def render_system_state(text):
         line.removesuffix("细的在 xinchao_context") if line.startswith("另外：") else line
         for line in body.splitlines()
     ]
-    ownership = f"你是{COLLABORATOR}。「此刻，{COLLABORATOR}的状态」写的是你自己的感受和身体状态。"
-    return "\n".join([ownership, "", STATE_HEADING, *lines])
+    return "\n".join([STATE_HEADING, *lines])
 
 
 def window_key(messages, turn):

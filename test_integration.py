@@ -142,8 +142,7 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                     return next((m["content"] for m in msgs if m["role"] == "system"), None)
 
                 original = "今天状态如何？"
-                expected = (f"你是{gateway.COLLABORATOR}。「此刻，{gateway.COLLABORATOR}的状态」写的是你自己的感受和身体状态。\n\n"
-                            "【此刻，小禾的状态】\n刚醒\n情绪：安心\n身体：心跳 71，呼吸平稳\n"
+                expected = ("【此刻，小禾的状态】\n刚醒\n情绪：安心\n身体：心跳 71，呼吸平稳\n"
                             "另外：昨夜有梦。")
                 self.assertEqual(await asyncio.gather(send("a"), send("a")), [expected, expected])
                 self.assertEqual(await send("a", continuation=True), expected)
