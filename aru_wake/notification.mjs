@@ -47,5 +47,6 @@ function stateNotice({message, sourceEventId = ''}) {
 export function aruNotificationText(delivery) {
   if (delivery.reason !== 'self_signal') return renderText(delivery).replace('】', '｜心潮 MCP】');
   const name = process.env.ARU_COLLABORATOR_NAME?.trim() || '小禾';
-  return `【此刻，${name}的状态】\n${stateNotice(delivery)}`;
+  const state = stateNotice(delivery).replaceAll('她', '主人');
+  return `【此刻，${name}的状态】\n${state}`;
 }
