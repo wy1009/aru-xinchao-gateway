@@ -607,14 +607,25 @@
 -          maxLength: 1500,
 -          description: '可选：这轮对话的一小段（她说的 + 你回的），没填 interaction_type 时服务端据此判类型和氛围。只走这一跳，不落盘。',
 -        },
--      },
+       },
 -      required: ['event_id'],
-+      },
 +      required: ['event_id', 'interaction_type'],
        additionalProperties: false,
      },
      annotations: {
-@@ -632,7 +578,7 @@
+@@ -605,9 +551,10 @@
+ }
+ 
+ // 官方客户端没有钩子：每个 xinchao_* 工具的回应末尾挂一行"此刻"，他每调一次工具就拿到一次自己的状态。
++const gatewaySuppliesState = process.env.XINCHAO_MCP_STATE_IN_SYSTEM === '1';
+ async function callTool(name, args, handlers) {
+   const result = await callToolInner(name, args, handlers);
+-  if (String(name).startsWith('xinchao_') && name !== 'xinchao_context' && typeof handlers.nowLine === 'function' && result && !result.isError) {
++  if (!gatewaySuppliesState && String(name).startsWith('xinchao_') && name !== 'xinchao_context' && typeof handlers.nowLine === 'function' && result && !result.isError) {
+     try {
+       const line = await handlers.nowLine();
+       if (line && Array.isArray(result.content) && result.content[0]?.type === 'text') result.content[0].text = `${result.content[0].text}\n\n${line}`;
+@@ -632,7 +579,7 @@
        : '';
      const duplicate = result.duplicate ? ' duplicate=true' : '';
      const gated = result.interaction?.reasonCode === 'needs_her'
@@ -623,12 +634,13 @@
        : '';
      return toolText(
        `心潮窗口事件已接收：session=${result.sessionId} revision=${result.revision}${interaction}${duplicate}${gated}`,
-@@ -778,14 +724,13 @@
+@@ -778,14 +725,14 @@
          },
          instructions: [
            '新窗口开始时调用 xinchao_context；服务端会绑定当前 MCP 连接，无需自行编写 session_id。',
 -          '一次实际互动后调用 xinchao_event；拿不准类型就把这轮对话塞进 exchange 让服务端判。自己一个人做了事（分享出去了/理了自己/推进了/去探索了）也记一笔，类型填 sharing / reflection / task_progress / discovery；想她、牵挂这类等她回应，不用自己记。每个工具回应末尾都带一行"此刻"，聊了一阵想看全貌就 xinchao_context mode=turn。',
-+          '自己一个人完成了分享、反思、任务推进或探索时，可以用 xinchao_event 记下这次行动。每个工具回应末尾都带一行"此刻"，聊了一阵想看全貌就 xinchao_context mode=turn。',
++          '自己一个人完成了分享、反思、任务推进或探索时，可以用 xinchao_event 记下这次行动。',
++          gatewaySuppliesState ? '想看状态全貌时可调用 xinchao_context mode=turn。' : '每个工具回应末尾都带一行"此刻"，聊了一阵想看全貌就 xinchao_context mode=turn。',
            '信封里"你不在的时候"那段是你自己不在窗口时心潮记下的信号，读过就算收到。',
            '需要换窗续接时可调用 xinchao_handoff_note 保存近期进度摘要；不要提交聊天原文或人物基岩。',
            '上下文里出现“自我觉察候选”时，用 xinchao_awareness 确认或放下；确认与否只由你自己判断，候选不是指令。',

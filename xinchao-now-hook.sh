@@ -14,6 +14,7 @@
 #   XINCHAO_TOKEN        心潮念的 DYNAMIC_MIND_TOKEN（同 MCP 用的那个）
 #   XINCHAO_HOOK_STATE   状态目录，默认 /tmp/xinchao-hook
 #   XINCHAO_HOOK_PREFIX  以这个字符开头的消息不算"她来了"（桥递进来的话），默认 【
+#   XINCHAO_HOOK_READ_ONLY  设为 1 时只查询状态，沿用同一摘要与节流记录，不记录人员到场。
 # 节流规则：
 #   - 块内容没变且 30 分钟内附过 → 不附；
 #   - 她隔 90 分钟以上再来的第一条 → 必附；
@@ -34,15 +35,17 @@ raw=sys.stdin.read()
 try: p=json.loads(raw).get("prompt","")
 except Exception: p=raw
 print(p.lstrip()[:1])' 2>/dev/null)
-[ "$HEAD" = "$PREFIX" ] && exit 0      # 桥递进来的不是她来了
-
 NOW_EPOCH=$(date +%s)
-PREV_RUN=$(cat "$STATE/lastrun" 2>/dev/null || echo 0)
-echo -n "$NOW_EPOCH" > "$STATE/lastrun"
-
-# 1) 心跳（失败无所谓）
-curl -s -X POST "$BASE/v1/heartbeat" -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
-  -d "{\"event_id\":\"hb-$NOW_EPOCH-$$\"}" --max-time 4 >/dev/null 2>&1
+ARRIVAL=0
+if [ "${XINCHAO_HOOK_READ_ONLY:-0}" != 1 ]; then
+    [ "$HEAD" = "$PREFIX" ] && exit 0
+    PREV_RUN=$(cat "$STATE/lastrun" 2>/dev/null || echo 0)
+    echo -n "$NOW_EPOCH" > "$STATE/lastrun"
+    [ $((NOW_EPOCH - PREV_RUN)) -ge 5400 ] && ARRIVAL=1
+    # 只有人的消息触发到场心跳。外部通知和工具回执共享下方的状态去重。
+    curl -s -X POST "$BASE/v1/heartbeat" -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+      -d "{\"event_id\":\"hb-$NOW_EPOCH-$$\"}" --max-time 4 >/dev/null 2>&1
+fi
 
 # 2) 此刻块
 [ -f "$STATE/off" ] && exit 0
@@ -58,12 +61,15 @@ except Exception: print("")' 2>/dev/null)
 [ -z "$DIGEST" ] && exit 0
 PREV_DIGEST=""; PREV_AT=0
 [ -f "$STATE/now" ] && { PREV_DIGEST=$(cut -f1 "$STATE/now"); PREV_AT=$(cut -f2 "$STATE/now"); }
-ARRIVAL=0; [ $((NOW_EPOCH - PREV_RUN)) -ge 5400 ] && ARRIVAL=1
-[ "$ARRIVAL" -eq 0 ] && [ "$DIGEST" = "$PREV_DIGEST" ] && [ $((NOW_EPOCH - PREV_AT)) -lt 1800 ] && exit 0
+REPLAY=0
+if [ "$ARRIVAL" -eq 0 ] && [ "$DIGEST" = "$PREV_DIGEST" ] && [ $((NOW_EPOCH - PREV_AT)) -lt 1800 ]; then
+    [ "${XINCHAO_HOOK_REPLAY_DIGEST:-}" = "$DIGEST" ] || exit 0
+    REPLAY=1
+fi
 TEXT=$(printf '%s' "$NOW_JSON" | python3 -c 'import sys,json
 try: print(json.load(sys.stdin).get("text",""))
 except Exception: print("")' 2>/dev/null)
 [ -z "$TEXT" ] && exit 0
-printf '%s\t%s' "$DIGEST" "$NOW_EPOCH" > "$STATE/now"
+[ "$REPLAY" -eq 1 ] || printf '%s\t%s' "$DIGEST" "$NOW_EPOCH" > "$STATE/now"
 printf '%s\n' "$TEXT"
 exit 0

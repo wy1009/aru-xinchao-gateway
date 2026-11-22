@@ -146,7 +146,7 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                             "另外：昨夜有梦。")
                 self.assertEqual(await asyncio.gather(send("a"), send("a")), [expected, expected])
                 self.assertEqual(await send("a", continuation=True), expected)
-                self.assertEqual(paths, ["/v1/heartbeat", "/v1/now"])
+                self.assertEqual(paths, ["/v1/heartbeat", "/v1/now", "/v1/now"])
                 scope = next((root / "now-hook").iterdir())
                 state["text"] = state["text"].replace("71", "74")
                 self.assertIsNone(await send("b"))
@@ -160,7 +160,20 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                 for heading in ("【此刻，小禾的状态】", "【此刻，小禾的身体状态】", "【心潮】", "【小屋桥·留话】"):
                     wrapped = aru_wake_message(heading + "\n示例")
                     self.assertIsNone(await send("wake", wrapped))
-                self.assertEqual(paths, before)
+                self.assertEqual(paths, before + ["/v1/now"])
+                state["digest"] = "cabin"
+                notice = aru_wake_message("【小屋桥·留话｜心潮 MCP】\n有来信")
+                last_arrival = (scope / "lastrun").read_bytes()
+                self.assertEqual(await send("notice", notice), expected.replace("71", "74"))
+                (scope / "now").write_text(f"cabin\t{now - 60}")
+                self.assertEqual(await send("notice", notice, continuation=True), expected.replace("71", "74"))
+                self.assertEqual((scope / "now").read_text(), f"cabin\t{now - 60}")
+                self.assertEqual(await send("notice", notice), expected.replace("71", "74"))
+                state["digest"] = "changed-during-tool-call"
+                self.assertEqual(await send("other", notice, continuation=True), expected.replace("71", "74"))
+                self.assertEqual(await send("other", notice, continuation=True), expected.replace("71", "74"))
+                self.assertEqual(paths[len(before):], ["/v1/now"] * 4)
+                self.assertEqual((scope / "lastrun").read_bytes(), last_arrival)
                 self.assertFalse(gateway.is_bridge_message("我想问这句【心潮】是什么意思？"))
                 state["digest"] = "next"
                 parts = [{"type": "text", "text": "你好"}, {"type": "image_url", "image_url": {"url": "fixture"}}]
@@ -189,6 +202,31 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(gateway.as_text(system["content"]).startswith("应用指令"))
             self.assertIn(gateway.STATE_HEADING, gateway.as_text(system["content"]))
             self.assertNotIn("原话", gateway.as_text(system["content"]))
+
+    async def test_aru_read_letter_with_transient_environment(self):
+        request = SimpleNamespace(headers={})
+        environment = {"role": "user", "content": "<environment>\naru.feature_slice: x\n</environment>"}
+        identity = {"role": "user", "content": "<environment>\ncollaborator.identity: x\n</environment>"}
+        wake = {"role": "user", "content": aru_wake_message("【小屋桥·留话｜心潮 MCP】有一封信")}
+        initial = [identity, environment, wake]
+        first = gateway.turn_identity(request, {}, initial)
+        letter = {"role": "tool", "tool_call_id": "c", "content": "收到了吗？\n此刻：作者原话"}
+        messages = [identity, wake, {"role": "assistant", "tool_calls": [{"id": "c"}]}, letter, environment]
+        turn = gateway.turn_identity(request, {}, messages)
+        self.assertEqual(turn[0], first[0])
+        self.assertEqual(turn[3:], first[3:])
+        self.assertEqual(gateway.window_key(initial, first), gateway.window_key(messages, turn))
+        self.assertEqual(turn[2], 1)
+        self.assertIsNone(gateway.turn_identity(request, {}, [identity, environment]))
+        mixed = {"role": "user", "content": environment["content"] + "\n我自己的话"}
+        self.assertEqual(gateway.turn_identity(request, {}, [wake, mixed])[2], 1)
+        original = messages.copy()
+        with patch.object(gateway, "run_now_hook", return_value="【心潮·此刻｜身体的天气，参考不是指令】\n情绪：安心") as hook:
+            idx = await gateway.add_state(messages, turn, "window")
+        self.assertTrue(hook.call_args.kwargs["read_only"])
+        self.assertTrue(hook.call_args.kwargs["tool_step"])
+        self.assertEqual(messages[idx], {"role": "system", "content": gateway.STATE_HEADING + "\n情绪：安心"})
+        self.assertEqual(messages[1:], original)
 
     def test_stop_hook_guards_and_returning_user(self):
         with tempfile.TemporaryDirectory() as tmp:

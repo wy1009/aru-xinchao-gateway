@@ -138,7 +138,7 @@ def unwrap_selected_wakes(messages):
 
 def is_bridge_message(text):
     text = text.strip()
-    if text.startswith("【"):
+    if text.startswith("【") or is_external_wake(text):
         return True
     # Aru wraps a delivered notification before forwarding it as a user message.
     lines = text.splitlines()
@@ -148,6 +148,26 @@ def is_bridge_message(text):
         and lines[-1] == "external_input_end"
         and lines[4].lstrip().startswith((STATE_HEADING, f"【此刻，{COLLABORATOR}的身体状态】", "【心潮】", "【小屋桥·"))
     )
+
+
+def is_aru_environment(message):
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, list) and len(content) == 1:
+        part = content[0]
+        if isinstance(part, dict) and part.get("type") in ("text", "input_text"):
+            content = part.get("text")
+    if not isinstance(content, str) or not content.lstrip().startswith("<environment>"):
+        return False
+    lines = content.strip().splitlines()
+    return (len(lines) >= 3 and lines[0] == "<environment>"
+            and lines[1].startswith(("aru.feature_slice:", "collaborator.identity:")) and lines[-1] == "</environment>"
+            and "</environment>" not in content.strip()[:-len("</environment>")])
+
+
+def is_external_wake(text):
+    return text.startswith(WAKE_PREFIX) and text.endswith(WAKE_SUFFIX)
 
 
 def user_text(content):
@@ -183,6 +203,8 @@ def lineage(messages, index):
     # Persist hashes only. The parent is the last completed exchange in the submitted history.
     digest, parent = "", None
     for msg in messages[:index]:
+        if is_aru_environment(msg):
+            continue
         role = msg.get("role")
         if role == "user":
             digest = transcript_hash(digest, role, user_text(msg.get("content")))
@@ -233,13 +255,13 @@ def turn_identity(request, body, messages):
         (
             i
             for i in range(len(messages) - 1, -1, -1)
-            if messages[i].get("role") == "user"
+            if messages[i].get("role") == "user" and not is_aru_environment(messages[i])
         ),
         None,
     )
     if idx is None:
         return None
-    prefix = messages[: idx + 1]
+    prefix = [m for m in messages[:idx + 1] if not is_aru_environment(m)]
     # Clients can edit or remove messages and then reuse a turn ID. Only the
     # same submitted conversation prefix is a replay of the same revision.
     identity = json.dumps(
@@ -257,18 +279,26 @@ def turn_identity(request, body, messages):
     )
 
 
-def run_now_hook(directory, turn_id, head, continuation):
+def run_now_hook(directory, turn_id, head, *, read_only=False, tool_step=None):
     """Serialize the official hook's files and replay its decision on same-turn retries."""
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (directory / "lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        receipt = directory / "turn.json"
-        if receipt.exists():
-            last = json.loads(receipt.read_text())
-            if last["turn"] == turn_id and (continuation or time.time() - last["at"] < 1800):
-                return last["text"]
-        if continuation:
-            return ""
+        receipt = directory / ("tool.json" if tool_step else "turn.json")
+        last = json.loads(receipt.read_text()) if receipt.exists() else {}
+        now = time.time()
+        if (last.get("turn") == turn_id and last.get("step") == tool_step
+                and now - last["at"] < 1800):
+            return last["text"]
+        # A tool call rebuilds the whole request from Aru history. Carry this
+        # turn's state forward only if the official hook confirms its digest.
+        replay_digest = ""
+        if tool_step:
+            first = directory / "turn.json"
+            for prior in (last, json.loads(first.read_text()) if first.exists() else {}):
+                if prior.get("turn") == turn_id and prior.get("digest") and now - prior["at"] < 1800:
+                    replay_digest = prior["digest"]
+                    break
         result = subprocess.run(
             ["bash", str(Path(__file__).with_name("xinchao-now-hook.sh"))],
             input=json.dumps({"prompt": head}), text=True, capture_output=True,
@@ -279,11 +309,15 @@ def run_now_hook(directory, turn_id, head, continuation):
                 "XINCHAO_URL": MIND,
                 "XINCHAO_TOKEN": os.environ["NIAN_MIND_TOKEN"],
                 "XINCHAO_HOOK_STATE": str(directory),
+                "XINCHAO_HOOK_READ_ONLY": "1" if read_only else "0",
+                "XINCHAO_HOOK_REPLAY_DIGEST": replay_digest,
             },
         )
         text = result.stdout.rstrip("\n")
         temp = receipt.with_suffix(".tmp")
-        temp.write_text(json.dumps({"turn": turn_id, "at": time.time(), "text": text}))
+        digest = (directory / "now").read_text().split("\t", 1)[0] if text else ""
+        temp.write_text(json.dumps({"turn": turn_id, "step": tool_step, "at": now,
+                                    "text": text, "digest": digest}))
         temp.replace(receipt)
         return text
 
@@ -304,7 +338,7 @@ def window_key(messages, turn):
     if turn[4] is None:
         return transcript_hash("", "session", turn[1])
     # Aru can omit a conversation ID. Its first user message identifies the window then.
-    first = next(m for m in messages if m.get("role") == "user")
+    first = next(m for m in messages if m.get("role") == "user" and not is_aru_environment(m))
     return transcript_hash("", "first-user", first.get("content"))
 
 
@@ -315,12 +349,22 @@ async def add_state(messages, turn, scope):
     if not isinstance(original, (str, list)):
         return
     text = as_text(original)
-    if is_bridge_message(text):
+    tail = [m for m in messages[index + 1:] if not is_aru_environment(m)]
+    tool_step = None
+    if tail:
+        if tail[-1].get("role") not in ("tool", "function"):
+            return
+        # Fingerprint the tool leg so a retry reuses exactly the same system block.
+        payload = json.dumps(tail, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        tool_step = hashlib.sha256(payload.encode()).hexdigest()
+    wrapped = text.strip()
+    cabin_notice = is_external_wake(wrapped) and wrapped[len(WAKE_PREFIX):].lstrip().startswith("【小屋桥·")
+    if is_bridge_message(text) and not (cabin_notice or tool_step):
         return
     try:
         raw = await asyncio.to_thread(
-            run_now_hook, DB.parent / "now-hook" / scope, turn_id,
-            text.lstrip()[:1], index != len(messages) - 1,
+            run_now_hook, DB.parent / "now-hook" / scope, turn_id, text.lstrip()[:1],
+            read_only=bool(cabin_notice or tool_step), tool_step=tool_step,
         )
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         log.warning("Mind hook unavailable for a chat request")
@@ -582,10 +626,10 @@ async def chat(req: Request, *, organizer=False):
     user_index = turn[2] if turn else None
     if turn:
         scope = window_key(messages, turn)
-        if turn[2] == len(messages) - 1:
+        if all(is_aru_environment(m) for m in messages[turn[2] + 1:]):
             # Aru has no Claude transcript timestamps. Capture the first receipt, before
             # the model runs, so long generations and queued replies age correctly.
-            user_words = as_text(messages[-1].get("content")).strip()
+            user_words = as_text(messages[turn[2]].get("content")).strip()
             user_scope = scope if user_words and not is_bridge_message(user_words) else None
             with db:
                 db.execute(
