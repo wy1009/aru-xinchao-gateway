@@ -24,7 +24,9 @@ function receipt(query) {
 }
 
 function aruNotificationText(delivery) {
-  if (delivery.reason !== 'self_signal') return renderText(delivery);
+  if (delivery.reason !== 'self_signal') {
+    return renderText(delivery).replace('】', '｜心潮 MCP】');
+  }
   return '【此刻，' + (process.env.ARU_COLLABORATOR_NAME || '小禾') + '的状态】\n' + delivery.message;
 }
 
