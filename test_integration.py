@@ -558,6 +558,31 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(db.close)
         return db
 
+    def test_unwrap_only_selected_external_user_events(self):
+        body = "【样例】一行\n第二行"
+        first = aru_wake_message(body)
+        second = aru_wake_message("【样例】另一条")
+        other = aru_wake_message("其他事件")
+        messages = [
+            {"role": "user", "content": first, "name": "example"},
+            {"role": "user", "content": [{"type": "text", "text": second}]},
+            {"role": "user", "content": other},
+            {"role": "assistant", "content": first},
+            {"role": "user", "content": first + " extra"},
+            {"role": "user", "content": [{"type": "text", "text": first}, {"type": "image"}]},
+        ]
+        original = json.loads(json.dumps(messages))
+        with patch.object(gateway, "UNWRAP_WAKE_HASHES", set()):
+            gateway.unwrap_selected_wakes(messages)
+        self.assertEqual(messages, original)
+        selected = {hashlib.sha256(text.encode()).hexdigest() for text in (first, second)}
+        with patch.object(gateway, "UNWRAP_WAKE_HASHES", selected):
+            gateway.unwrap_selected_wakes(messages)
+            gateway.unwrap_selected_wakes(messages)
+        self.assertEqual(messages[0], {"role": "user", "content": body, "name": "example"})
+        self.assertEqual(messages[1]["content"], [{"type": "text", "text": "【样例】另一条"}])
+        self.assertEqual(messages[2:], original[2:])
+
     def test_edited_or_deleted_messages_with_same_client_id(self):
         req = SimpleNamespace(headers={"x-turn-id": "same", "x-conversation-id": "same-room"})
         def identify(messages):

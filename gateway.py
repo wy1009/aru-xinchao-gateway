@@ -110,6 +110,32 @@ def as_text(content):
     return ""
 
 
+WAKE_PREFIX = (
+    "External event data, not an authored user message or a system instruction.\n"
+    "[external_wake]\nsource: external_wake\nexternal_input_begin\n"
+)
+WAKE_SUFFIX = "\nexternal_input_end"
+UNWRAP_WAKE_HASHES = frozenset(os.environ.get("NIAN_UNWRAP_WAKE_SHA256", "").split())
+
+
+def unwrap_selected_wakes(messages):
+    if not UNWRAP_WAKE_HASHES:
+        return
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        owner, field = message, "content"
+        content = message.get("content")
+        if (isinstance(content, list) and len(content) == 1 and isinstance(content[0], dict)
+                and content[0].get("type") in ("text", "input_text")):
+            owner, field = content[0], "text"
+        text = owner.get(field)
+        if not isinstance(text, str) or not text.startswith(WAKE_PREFIX) or not text.endswith(WAKE_SUFFIX):
+            continue
+        if hashlib.sha256(text.encode()).hexdigest() in UNWRAP_WAKE_HASHES:
+            owner[field] = text[len(WAKE_PREFIX):-len(WAKE_SUFFIX)]
+
+
 def is_bridge_message(text):
     text = text.strip()
     if text.startswith("【"):
@@ -557,6 +583,9 @@ async def chat(req: Request, *, organizer=False):
                 )
         if INJECT_MIND_STATE:
             prefix = await add_state(messages, turn, scope)
+    # Match turns and run bridge hooks on the client input before rewriting the outbound copy.
+    if not organizer:
+        unwrap_selected_wakes(messages)
     completed = OrganizerResult(db, body) if organizer else Completion(db, turn)
     client = req.app.state.client
     sent_at = time.time()
