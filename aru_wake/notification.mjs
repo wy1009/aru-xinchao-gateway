@@ -29,7 +29,12 @@ const signalSpeech = new Map(Object.entries({
   obsession: '有件事在我心里绕了好几回，我又想起它了。',
 }));
 
-function selfSpeech(sourceEventId = '') {
+function selfSpeech(sourceEventId) {
+  const name = process.env.ARU_COLLABORATOR_NAME?.trim() || '小禾';
+  return `【因为心潮翻涌，${name}忍不住主动和主人说话，${name}说：】\n${spokenLine(sourceEventId)}`;
+}
+
+function spokenLine(sourceEventId = '') {
   if (sourceEventId.startsWith('box-remind-')) return '我记得自己在黑匣子里留了件事，今天到时候了。';
   const peak = /^(?:self-drive_peak|drive-prompt)-([a-z_]+)-/.exec(sourceEventId);
   if (peak && driveSpeech.has(peak[1])) return driveSpeech.get(peak[1]);

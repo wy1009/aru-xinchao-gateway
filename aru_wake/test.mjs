@@ -4,6 +4,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {randomBytes,randomUUID,createDecipheriv} from 'node:crypto';
 import {deliver} from './adapter.mjs';
+process.env.ARU_COLLABORATOR_NAME = '小满';
 process.env.ARU_PUBLIC_ORIGIN = 'https://gateway.example.org';
 const spool=await mkdtemp(join(tmpdir(),'aru-wake-test-'));
 try {
@@ -56,7 +57,10 @@ try {
    ['self-wake_residue-dream-abc-123', '我刚醒，梦里的感觉还留着一点。'],
    ['box-remind-box-id', '我记得自己在黑匣子里留了件事，今天到时候了。'],
    [undefined, '我这会儿想跟您说说话。'],
- ]) assert.equal(await speech('self_signal', source, '去做某事。 此刻：分享欲（涨）、牵挂（平）'), expected);
+ ]) {
+   const text = await speech('self_signal', source, '去做某事。 此刻：分享欲（涨）、牵挂（平）');
+   assert.equal(text, '【因为心潮翻涌，小满忍不住主动和主人说话，小满说：】\n' + expected);
+ }
  const onDisk=await readFile(join(spool,id+'.json'),'utf8');assert.ok(!onDisk.includes('test only')&&!onDisk.includes(bundle.encryptionKey));
  console.log('PASS encryption, target binding, duplicate recovery, Host-only pending, phone ACK and reason filtering');
 } finally { await rm(spool,{recursive:true,force:true}); }
