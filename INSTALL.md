@@ -34,3 +34,12 @@ node aru_wake/test.mjs
 CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, at REAL NOT NULL, status TEXT NOT NULL, entries TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS audit_by_time ON audit(at);
 ```
+
+### 将 Leto 的群聊唤醒转给同一个 Aru 会话
+
+本组件使用 [Leto 官方唤醒桥](https://github.com/oliscatt/leto-wake-bridge/tree/54fbcf78851b3c45d6880af3eb83d73b6a1122b1) 的 SSE 订阅、待办补查和投递队列。安装前先完成上面的 Aru Host 配对、发送方配置和回执 socket，运行 `node --test aru_wake/leto.test.mjs` 验证适配器。
+
+1. 在 `/opt/leto-wake-bridge/` 下安装本仓库的 `aru_wake/leto.mjs`、`transport.mjs` 和 `aru/wake-send.mjs`，保持这三个文件的相对路径。将上述官方版本的 `bridge.mjs` 和 `LICENSE` 放入该目录下的 `upstream/`。
+2. 创建同名系统用户和组 `leto-wake-bridge`。在仅 root 可读的 `/etc/leto-wake-bridge.env` 中设置 `LETO_MACHINE_TOKEN`、`LETO_BASE_URL=https://leto.sarl` 和与发送方配置一致的 `ARU_PUBLIC_ORIGIN`。桥会在每次投递时读取当前手机绑定。
+3. 将 `aru_wake/leto-wake-bridge.service` 安装到 `/etc/systemd/system/`，将 `aru_wake/leto-aru-bridge.tmpfiles.conf` 安装到 `/etc/tmpfiles.d/`。运行 `systemctl daemon-reload` 和 `systemctl enable --now leto-wake-bridge.service`。单元使用 systemd 254+ 的重启退避。
+4. 在手机 Aru 给对应协作者启用 HTTP MCP `https://leto.sarl/mcp`，请求头为 `Authorization: Bearer <Leto 机器令牌>`。在已加入的 Leto 群里 @ 该协作者即可联测。桥日志里的“已投递”表示手机回了收件回执，实际群回复可在 Leto 查看。

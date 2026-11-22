@@ -1,0 +1,27 @@
+[Unit]
+Description=Leto wake stream for the paired Aru conversation
+Wants=network-online.target aru-selfhost.service nian-aru-receipt.socket
+After=network-online.target aru-selfhost.service nian-aru-receipt.socket
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=leto-wake-bridge
+SupplementaryGroups=nian-aru-bridge
+EnvironmentFile=/etc/leto-wake-bridge.env
+ExecStart=/usr/local/bin/node /opt/leto-wake-bridge/leto.mjs
+Restart=always
+RestartSec=10s
+RestartSteps=5
+RestartMaxDelaySec=2min
+StateDirectory=leto-aru-bridge
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target
