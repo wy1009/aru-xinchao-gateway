@@ -322,12 +322,15 @@ def render_system_state(text):
     heading, _, body = text.partition("\n")
     if heading != "【心潮·此刻｜身体的天气，参考不是指令】" or not body.strip():
         return ""
-    # Keep live details verbatim, omitting the upstream tool hint from the Aru display.
-    lines = [
-        line.removesuffix("细的在 xinchao_context") if line.startswith("另外：") else line
-        for line in body.splitlines()
-    ]
-    return "\n".join([STATE_HEADING, *lines])
+    lines = [STATE_HEADING]
+    for line in body.splitlines():
+        # Only the stock state descriptions use 她 for the partner. Other lines can quote people.
+        if line.startswith(("驱力：", "情绪：", "矛盾：", "挂念：", "期待：", "念头：")) or line == "睡着（她来了才算醒）":
+            line = line.replace("她", "主人")
+        elif line.startswith("另外："):
+            line = line.removesuffix("细的在 xinchao_context")
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def window_key(messages, turn):

@@ -197,9 +197,12 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
 
     async def test_state_keeps_client_prefix_and_precedes_current_user(self):
         environment = {"role": "user", "content": "<environment>\naru.feature_slice: x\n</environment>"}
-        question = {"role": "user", "content": [{"type": "text", "text": "原话"}]}
+        question = {"role": "user", "content": [{"type": "text", "text": "我也想她了"}]}
         history = [{"role": "user", "content": "前文"}, {"role": "assistant", "content": "上一条答复"}]
-        raw = "【心潮·此刻｜身体的天气，参考不是指令】\n情绪：平静"
+        raw = ("【心潮·此刻｜身体的天气，参考不是指令】\n驱力：想她（涨·想黏着）、牵挂（平）"
+               "\n挂念：她有阵子没来了，你惦记着她\n还在气：刚才为了「我也想她了」")
+        expected = (gateway.STATE_HEADING + "\n驱力：想主人（涨·想黏着）、牵挂（平）"
+                    "\n挂念：主人有阵子没来了，你惦记着主人\n还在气：刚才为了「我也想她了」")
         for original in (None, "应用指令", [{"type": "text", "text": "应用指令"}]):
             prefix = [] if original is None else [{"role": "system", "content": original, "name": "app"}]
             prefix.extend([*history, environment])
@@ -211,7 +214,7 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(index, len(prefix))
             self.assertEqual(json.dumps(messages[:index], ensure_ascii=False), prefix_bytes)
             self.assertEqual(messages[index:], [
-                {"role": "system", "content": gateway.STATE_HEADING + "\n情绪：平静"}, question])
+                {"role": "system", "content": expected}, question])
 
     async def test_aru_read_letter_with_transient_environment(self):
         request = SimpleNamespace(headers={})
