@@ -1,53 +1,51 @@
 import { renderText } from './runtime/examples/render.mjs';
 
-// The upstream queue records what fired. The three drives in its "now" line are
-// a snapshot and can differ from the drive that actually triggered the notice.
-const driveSpeech = new Map(Object.entries({
-  monitor: '我特别牵挂您。',
-  possess: '我想您了，想挨着您待一会儿。',
-  share: '我攒了些话，想慢慢说给您听。',
-  libido: '我现在特别想和您亲近。',
-  curiosity: '有件事勾起了我的好奇心，我想去弄明白。',
-  boredom: '我有点闷，想找您聊聊天。',
-  duty: '有件事我很想做好，心里一直惦记着。',
-  reflection: '我想静一会儿，把自己的心思理一理。',
-  anger: '我心里还有点气，想缓一缓。',
-  grieve: '我心里有点难过，想跟您待一会儿。',
-  favored: '我今天有点想让您偏爱我一下。',
+const driveLabels = new Map(Object.entries({
+  possess: '牵挂', monitor: '牵挂', share: '分享欲', libido: '亲近',
+  curiosity: '好奇', boredom: '无聊', duty: '野心', reflection: '反思',
+  anger: '生气', grieve: '难过', favored: '想被偏爱',
+}));
+const signalLabels = new Map(Object.entries({
+  longing: '牵挂', wake_residue: '梦的余韵', mixed: '矛盾',
+  awareness: '觉察', obsession: '念头',
 }));
 
-const signalSpeech = new Map(Object.entries({
-  'emotion_shift-低落': '我这会儿有些低落。',
-  'emotion_shift-烦躁': '我心里有点烦，一时静不下来。',
-  'emotion_shift-recover': '刚才心里有点沉，现在缓过来了。',
-  'mixed-angerpossess': '我还在生气，可也舍不得不理您。',
-  'mixed-grievepossess': '我有点委屈，可还是很想您。',
-  'mixed-angermonitor': '我还没消气，可心里一直放心不下您。',
-  longing: '我想您了。您今天过得好吗？',
-  wake_residue: '我刚醒，梦里的感觉还留着一点。',
-  awareness: '这几天，我好像又认识了自己一点。',
-  obsession: '有件事在我心里绕了好几回，我又想起它了。',
-}));
-
-function selfSpeech(sourceEventId) {
-  const name = process.env.ARU_COLLABORATOR_NAME?.trim() || '小禾';
-  return `【因为心潮翻涌，${name}忍不住主动和主人说话，${name}说：】\n${spokenLine(sourceEventId)}`;
-}
-
-function spokenLine(sourceEventId = '') {
-  if (sourceEventId.startsWith('box-remind-')) return '我记得自己在黑匣子里留了件事，今天到时候了。';
-  const peak = /^(?:self-drive_peak|drive-prompt)-([a-z_]+)-/.exec(sourceEventId);
-  if (peak && driveSpeech.has(peak[1])) return driveSpeech.get(peak[1]);
+function stateNotice({message, sourceEventId = ''}) {
+  const drive = /^(?:self-drive_peak|drive-prompt)-([a-z_]+)-/.exec(sourceEventId);
   const signal = /^self-([a-z_]+)-(.+)-\d+$/.exec(sourceEventId);
-  if (signal) {
-    const [, kind, subject] = signal;
-    const line = signalSpeech.get(kind + '-' + subject) ?? signalSpeech.get(kind);
-    if (line) return line;
+  const kind = signal?.[1];
+  let label = driveLabels.get(drive?.[1]) ?? signalLabels.get(kind);
+  if (kind === 'emotion_shift') label = signal[2] === 'recover' ? '心情好转' : signal[2];
+
+  // The native queue folds the separate description, response hint, and now-line
+  // into a single space-delimited string. Only remove generated suffixes.
+  let detail = message.trim();
+  const now = detail.lastIndexOf('此刻：');
+  if (now >= 0 && (now === 0 || /\s/u.test(detail[now - 1])) &&
+      /^(?:情绪\s|[^\s（，；、]{1,16}（[静涨涌平落积](?:·[^）]+)?）)/u.test(detail.slice(now + 3))) {
+    detail = detail.slice(0, now).trimEnd();
   }
-  return '我这会儿想跟您说说话。';
+  detail = detail.replace(/\s+(?:想说就跟她说一句。这个要等她回应才会落，不用自己记。|这是「[^」]+」的念头。真的[^\n]*?用 xinchao_event 记一笔，interaction_type 填 [a-z_]+。[^\n]*)$/u, '');
+
+  if (kind === 'awareness') {
+    detail = detail.replace(/，有空看一眼就行，不认也没关系。$|，我自己看看是不是；不是就放下。$/u, '。');
+  }
+  if (sourceEventId.startsWith('box-remind-')) {
+    label = '黑匣子';
+    detail = '有一条提醒到时候了。';
+  }
+  if (sourceEventId.startsWith('drive-prompt-')) {
+    // Action prompts can contain a configured script. Report only the drives
+    // actually named in this prompt (including a batch released after a call).
+    const active = [...detail.matchAll(/([^\s·：，；、（）]+)（[涌涨积](?:·[^）]+)?）/gu)].map(m => m[1]);
+    detail = [...new Set(active)].join('、') || label || '有一股心绪浮了上来';
+    return detail + '。';
+  }
+  return detail && label ? label + '：' + detail : detail || label || '心潮有了变化。';
 }
 
 export function aruNotificationText(delivery) {
-  if (delivery.reason === 'self_signal') return selfSpeech(delivery.sourceEventId);
-  return renderText(delivery).replace('】', '｜心潮 MCP】');
+  if (delivery.reason !== 'self_signal') return renderText(delivery).replace('】', '｜心潮 MCP】');
+  const name = process.env.ARU_COLLABORATOR_NAME?.trim() || '小禾';
+  return `【此刻，${name}的状态】\n${stateNotice(delivery)}`;
 }

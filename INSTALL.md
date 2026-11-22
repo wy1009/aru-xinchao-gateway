@@ -18,7 +18,7 @@ node aru_wake/test.mjs
 1. 按固定版本的上游说明运行心潮和 OB。原生部署中，心潮监听本机 18110，OB 监听本机 18001。网关通过 `NIAN_MIND_URL` 和 `NIAN_OB_URL` 访问它们。心潮的 `SERVICE_TOKEN` 与网关的 `NIAN_MIND_TOKEN` 使用同一值，OB 和网关另共享 `NIAN_INTERNAL_TOKEN`。
 2. 为网关创建私有环境文件。配置 `XINCHAO_CHAT_API_KEY`、`NIAN_MIND_TOKEN`、`NIAN_INTERNAL_TOKEN`、`NIAN_CLIENT_SHA256`、`NIAN_UPSTREAM_DIR` 和 `NIAN_QUEUE_DB`。客户端使用单独随机生成的 Bearer 令牌，`NIAN_CLIENT_SHA256` 填该令牌 UTF-8 字节的 SHA-256 小写十六进制摘要。上游聊天地址和模型名可通过 `NIAN_CHAT_URL` 和 `NIAN_MODEL` 修改。使用 Aru 备份作为记忆源时设 `NIAN_CHAT_MEMORY_IMPORT=0`。
 3. 给网关进程创建专用可写的队列目录。在加载上述变量的环境中，从本项目根目录运行 `.venv/bin/uvicorn gateway:app --host 127.0.0.1 --port 18111 --no-access-log`。生产可用 `systemd/nian-gateway.service`，按实际目录、服务账号和虚拟环境路径调整。HTTPS 反向代理将 `/nian/` 前缀剥离后送往该端口，客户端填 `https://你的域名/nian/v1`。
-4. 将 `ARU_COLLABORATOR_NAME` 设为实际协作者名，网关和通知桥的环境都要设置这个变量，状态标题和主动短句会使用同一名字。备份导入另需 `ARU_COLLABORATOR_ID`，其值是原备份中 `collaborator.id`。请在网关、OB 和导入服务上使用同一组协作者设置。已有同步数据库绑定一位协作者，切换身份时使用独立的状态目录与 OB 库。
+4. 将 `ARU_COLLABORATOR_NAME` 设为实际协作者名，网关和通知桥的环境都要设置这个变量，普通聊天和主动通知的状态标题会使用同一名字。备份导入另需 `ARU_COLLABORATOR_ID`，其值是原备份中 `collaborator.id`。请在网关、OB 和导入服务上使用同一组协作者设置。已有同步数据库绑定一位协作者，切换身份时使用独立的状态目录与 OB 库。
 
 ## 可选组件
 

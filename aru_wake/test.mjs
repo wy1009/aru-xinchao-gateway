@@ -49,17 +49,27 @@ try {
    const envelope = await deliver({...note, reason, sourceEventId, message, deliveryId:'delivery-' + randomUUID()}, bundle, opts);
    return unseal(envelope).content;
  }
- for (const [source, expected] of [
-   ['self-drive_peak-monitor-123', '我特别牵挂您。'],
-   ['self-drive_peak-share-123', '我攒了些话，想慢慢说给您听。'],
-   ['self-mixed-angermonitor-123', '我还没消气，可心里一直放心不下您。'],
-   ['self-emotion_shift-recover-123', '刚才心里有点沉，现在缓过来了。'],
-   ['self-wake_residue-dream-abc-123', '我刚醒，梦里的感觉还留着一点。'],
-   ['box-remind-box-id', '我记得自己在黑匣子里留了件事，今天到时候了。'],
-   [undefined, '我这会儿想跟您说说话。'],
- ]) {
-   const text = await speech('self_signal', source, '去做某事。 此刻：分享欲（涨）、牵挂（平）');
-   assert.equal(text, '【因为心潮翻涌，小满忍不住主动和主人说话，小满说：】\n' + expected);
+ const now = '此刻：牵挂（涌）、想她（平）、分享欲（平）；情绪 平静';
+ const personalHint = '想说就跟她说一句。这个要等她回应才会落，不用自己记。';
+ const sharingHint = '这是「分享欲」的念头。真的说出去了、发给她看了，用 xinchao_event 记一笔，interaction_type 填 sharing。光想着要说不算。';
+ const samples = [
+   ['self-drive_peak-possess-123', '想她的劲儿两个小时没下去了。 ' + personalHint + ' ' + now, '牵挂：想她的劲儿两个小时没下去了。'],
+   ['self-drive_peak-monitor-124', '心里一直挂着她，放不下来。\n' + personalHint + '\n' + now, '牵挂：心里一直挂着她，放不下来。'],
+   ['self-drive_peak-share-125', '有东西想给她看，等她。 ' + sharingHint + ' ' + now, '分享欲：有东西想给她看，等她。'],
+   ['self-emotion_shift-低落-126', '心里沉着，被冷落那阵子留下来的。 此刻：情绪 低落', '低落：心里沉着，被冷落那阵子留下来的。'],
+   ['self-emotion_shift-recover-127', '心里松下来了，不像刚才那样沉。 ' + now, '心情好转：心里松下来了，不像刚才那样沉。'],
+   ['self-mixed-angermonitor-128', '气归气，还是放心不下她。 ' + now, '矛盾：气归气，还是放心不下她。'],
+   ['self-wake_residue-dream-abc-129', '刚醒。梦里剩了一句：此刻：她在桥上（雨停了）。 ' + now, '梦的余韵：刚醒。梦里剩了一句：此刻：她在桥上（雨停了）。'],
+   ['self-obsession-share-130', '有件事今天一直在脑子里绕：我想起她。还有桥上的那盏灯。 ' + sharingHint + ' ' + now, '念头：有件事今天一直在脑子里绕：我想起她。还有桥上的那盏灯。'],
+   ['self-awareness-weekabc-131', '这周攒了2条觉察候选，有空看一眼就行，不认也没关系。 ' + now, '觉察：这周攒了2条觉察候选。'],
+   ['drive-prompt-monitor-132', '驱力提示 · 牵挂（积·3 小时）：给她留言。 ' + now, '牵挂。'],
+   ['drive-prompt-share-133', '驱力提示 · 挂断了，通话中攒下：好奇（涨）、分享欲（涌） · 给她留言。 ' + now, '好奇、分享欲。'],
+   ['box-remind-box-id', '匣子里有一条到点了：私人标题。xinchao_box read box-id', '黑匣子：有一条提醒到时候了。'],
+   [undefined, '刚刚又想起她。 此刻：河边的风停了。', '刚刚又想起她。 此刻：河边的风停了。'],
+ ];
+ for (const [source, message, expected] of samples) {
+   const text = await speech('self_signal', source, message);
+   assert.equal(text, '【此刻，小满的状态】\n' + expected);
  }
  const onDisk=await readFile(join(spool,id+'.json'),'utf8');assert.ok(!onDisk.includes('test only')&&!onDisk.includes(bundle.encryptionKey));
  console.log('PASS encryption, target binding, duplicate recovery, Host-only pending, phone ACK and reason filtering');
