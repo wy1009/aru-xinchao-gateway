@@ -1,0 +1,24 @@
+[Unit]
+Description=Aru backup upload page
+After=network.target
+
+[Service]
+User=aru-inbox
+Group=aru-inbox
+StateDirectory=aru-backup-inbox
+StateDirectoryMode=0700
+EnvironmentFile=/etc/xinchao-nian/aru-backup-inbox.env
+Environment=INBOX_PATH=/aru-backup
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/xinchao-nian/venv/bin/uvicorn --app-dir /opt/xinchao-nian/aru-inbox aru_portal:app --host 127.0.0.1 --port 19148 --no-access-log
+Restart=always
+RestartSec=2
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectProc=invisible
+
+[Install]
+WantedBy=multi-user.target

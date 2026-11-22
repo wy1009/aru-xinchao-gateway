@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for Aru memory enrichment requests
+After=aru-backup-inbox.service
+
+[Path]
+PathExists=/var/lib/aru-backup-inbox/enrich.request
+PathExists=/var/lib/aru-backup-inbox/enrich.running
+
+[Install]
+WantedBy=multi-user.target

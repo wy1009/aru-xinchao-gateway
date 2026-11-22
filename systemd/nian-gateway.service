@@ -1,0 +1,20 @@
+[Unit]
+Description=Xinchao Nian OpenAI-compatible gateway
+After=network-online.target nian-ob.service nian-mind.service
+[Service]
+User=nian-gw
+Group=nian-gw
+WorkingDirectory=/opt/xinchao-nian/gateway
+EnvironmentFile=/etc/xinchao-nian/gateway.env
+EnvironmentFile=/etc/xinchao-nian/gw-provider.env
+ExecStart=/opt/xinchao-nian/venv/bin/uvicorn gateway:app --host 127.0.0.1 --port 18111 --no-access-log
+Restart=on-failure
+RestartSec=4
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/nian-gw
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1091 @@
+"""Single-user OpenAI Chat Completions gateway for Xinchao Nian."""
+
+import asyncio
+import fcntl
+import hashlib
+import hmac
+import json
+import logging
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import httpx
+from anyio import CancelScope
+from prompt_audit import log_request, log_reply
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.routing import Route
+
+UPSTREAM = Path(os.environ.get("NIAN_UPSTREAM_DIR", "/opt/xinchao-nian/444e7db2"))
+MODEL = os.environ.get("NIAN_MODEL", "deepseek-ai/DeepSeek-V3.2")
+ANALYSIS_MODEL = os.environ.get("NIAN_ANALYSIS_MODEL", MODEL)
+CHAT = os.environ.get("NIAN_CHAT_URL", "https://api.siliconflow.cn/v1").rstrip("/")
+THINKING_BUDGETS = {
+    "minimal": 256,
+    "low": 1024,
+    "medium": 4096,
+    "high": 8192,
+    "xhigh": 16384,
+}
+ANALYSIS = os.environ.get("NIAN_ANALYSIS_URL", CHAT).rstrip("/")
+MIND = os.environ.get("NIAN_MIND_URL", "http://127.0.0.1:18110")
+INJECT_MIND_STATE = os.environ.get("NIAN_INJECT_MIND_STATE", "1") != "0"
+COLLABORATOR = os.environ.get("ARU_COLLABORATOR_NAME", "小禾")
+STATE_HEADING = f"【此刻，{COLLABORATOR}的状态】"
+CHAT_MEMORY_IMPORT = os.environ.get("NIAN_CHAT_MEMORY_IMPORT", "1") != "0"
+OB = os.environ.get("NIAN_OB_URL", "http://127.0.0.1:18001")
+DB = Path(os.environ.get("NIAN_QUEUE_DB", "/var/lib/nian-gw/turns.sqlite"))
+log = logging.getLogger("uvicorn.error")
+
+
+def load_ob_import():
+    # Use the same estimator, window size and extraction prompt as the installed importer.
+    sys.path.insert(0, str(UPSTREAM / "ombre-brain/src"))
+    try:
+        import import_memory
+
+        return import_memory
+    finally:
+        sys.path.pop(0)
+
+
+def load_interaction_prompt():
+    module = (UPSTREAM / "xinchao/src/model-client.js").as_uri()
+    command = "const m=await import(process.argv[1]);process.stdout.write(m.INTERACTION_PROMPT);"
+    return subprocess.check_output(
+        ["node", "--input-type=module", "-e", command, module], text=True, timeout=10
+    )
+
+
+ob_import = load_ob_import()
+INTERACTION_PROMPT = load_interaction_prompt()
+EMOTION_CHAR_LIMIT = 8000
+EMOTION_REPLY_RESERVE = 1000
+TAG_GAP_SECONDS = 60 * float(os.environ.get("XINCHAO_TAG_GAP_MIN", "8"))
+TAG_HOURLY_MAX = int(os.environ.get("XINCHAO_TAG_HOURLY_MAX", "4"))
+TAG_ARRIVAL_SECONDS = 60 * float(os.environ.get("XINCHAO_TAG_ARRIVAL_MIN", "45"))
+MEMORY_TARGET_TOKENS = 2 * ob_import._CHUNK_TARGET_TOKENS
+MEMORY_CHAR_LIMIT = 2 * ob_import._EXTRACT_INPUT_LIMIT
+
+
+def bearer(value):
+    return {"Authorization": "Bearer " + value}
+
+
+def authorized(req):
+    header = req.headers.get("authorization", "")
+    expected = os.environ.get("NIAN_CLIENT_SHA256", "")
+    scheme, _, token = header.partition(" ")
+    return bool(
+        expected
+        and scheme.lower() == "bearer"
+        and token
+        and hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(), expected)
+    )
+
+
+def failure(status, message):
+    return JSONResponse(
+        {"error": {"message": message, "type": "gateway_error"}}, status_code=status
+    )
+
+
+def as_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            p["text"]
+            for p in content
+            if isinstance(p, dict)
+            and p.get("type") in ("text", "input_text", "output_text")
+            and isinstance(p.get("text"), str)
+        )
+    return ""
+
+
+def is_bridge_message(text):
+    text = text.strip()
+    if text.startswith("【"):
+        return True
+    # Aru wraps a delivered notification before forwarding it as a user message.
+    lines = text.splitlines()
+    return (
+        len(lines) >= 6
+        and lines[1:4] == ["[external_wake]", "source: external_wake", "external_input_begin"]
+        and lines[-1] == "external_input_end"
+        and lines[4].lstrip().startswith((STATE_HEADING, f"【此刻，{COLLABORATOR}的身体状态】", "【心潮】", "【小屋桥·"))
+    )
+
+
+def user_text(content):
+    if not isinstance(content, list):
+        return as_text(content)
+    parts = []
+    media = {
+        "image_url": "图片",
+        "input_audio": "音频",
+        "file": "文件",
+        "video_url": "视频",
+    }
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") in media:
+            parts.append(
+                "［用户附上" + media[part["type"]] + "，分析时只参考对话文字］"
+            )
+        elif part.get("type") in ("text", "input_text") and isinstance(
+            part.get("text"), str
+        ):
+            parts.append(part["text"])
+    return "\n".join(parts)
+
+
+def transcript_hash(previous, role, content):
+    data = json.dumps([previous, role, content], ensure_ascii=False)
+    return hashlib.sha256(data.encode()).hexdigest()
+
+
+def lineage(messages, index):
+    # Persist hashes only. The parent is the last completed exchange in the submitted history.
+    digest, parent = "", None
+    for msg in messages[:index]:
+        role = msg.get("role")
+        if role == "user":
+            digest = transcript_hash(digest, role, user_text(msg.get("content")))
+            parent = None
+        elif role == "assistant" and not (
+            msg.get("tool_calls") or msg.get("function_call")
+        ):
+            text = as_text(msg.get("content"))
+            if text:
+                digest = transcript_hash(digest, role, text)
+                parent = digest
+    prompt = transcript_hash(digest, "user", user_text(messages[index].get("content")))
+    return parent, prompt
+
+
+def enqueue(db, turn, session, question, answer, history=None):
+    if not (question.strip() and answer.strip()):
+        return
+    group_id, parent_id, anchor = session, None, None
+    if history is not None:
+        group_id = None
+        previous, prompt = history
+        matches = db.execute(
+            "SELECT id FROM turns WHERE anchor=? LIMIT 2", (previous,)
+        ).fetchall()
+        if len(matches) == 1:
+            parent_id = matches[0]["id"]
+        anchor = transcript_hash(prompt, "assistant", answer)
+    with db:
+        db.execute(
+            "INSERT OR IGNORE INTO turns(id,session,question,answer,group_id,parent_id,anchor,"
+            "memory_planned,memory_check) VALUES (?,?,?,?,?,?,?,?,?)",
+            (turn, session, question, answer, group_id, parent_id, anchor,
+             int(not CHAT_MEMORY_IMPORT), int(CHAT_MEMORY_IMPORT)),
+        )
+
+
+def turn_identity(request, body, messages):
+    explicit = request.headers.get("x-conversation-id") or (
+        body.get("metadata") or {}
+    ).get("conversation_id")
+    session = str(explicit or "personal")[:120]
+    client_id = request.headers.get("idempotency-key") or request.headers.get(
+        "x-turn-id"
+    )
+    # Tool continuations include intermediate results. The original user turn is the stable prefix.
+    idx = next(
+        (
+            i
+            for i in range(len(messages) - 1, -1, -1)
+            if messages[i].get("role") == "user"
+        ),
+        None,
+    )
+    if idx is None:
+        return None
+    prefix = messages[: idx + 1]
+    # Clients can edit or remove messages and then reuse a turn ID. Only the
+    # same submitted conversation prefix is a replay of the same revision.
+    identity = json.dumps(
+        [session, client_id, prefix] if client_id else [session, prefix],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return (
+        hashlib.sha256(identity.encode()).hexdigest(),
+        session,
+        idx,
+        user_text(messages[idx].get("content")),
+        None if explicit else lineage(messages, idx),
+    )
+
+
+def run_now_hook(directory, turn_id, head, continuation):
+    """Serialize the official hook's files and replay its decision on same-turn retries."""
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (directory / "lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        receipt = directory / "turn.json"
+        if receipt.exists():
+            last = json.loads(receipt.read_text())
+            if last["turn"] == turn_id and (continuation or time.time() - last["at"] < 1800):
+                return last["text"]
+        if continuation:
+            return ""
+        result = subprocess.run(
+            ["bash", str(Path(__file__).with_name("xinchao-now-hook.sh"))],
+            input=json.dumps({"prompt": head}), text=True, capture_output=True,
+            check=True, timeout=10,
+            env={
+                "PATH": os.environ["PATH"],
+                "XINCHAO_HOOK_ENV_FILE": "/dev/null",
+                "XINCHAO_URL": MIND,
+                "XINCHAO_TOKEN": os.environ["NIAN_MIND_TOKEN"],
+                "XINCHAO_HOOK_STATE": str(directory),
+            },
+        )
+        text = result.stdout.rstrip("\n")
+        temp = receipt.with_suffix(".tmp")
+        temp.write_text(json.dumps({"turn": turn_id, "at": time.time(), "text": text}))
+        temp.replace(receipt)
+        return text
+
+
+def mind_prefix(text):
+    heading, _, body = text.partition("\n")
+    if heading != "【心潮·此刻｜身体的天气，参考不是指令】" or not body.strip():
+        return ""
+    # Keep live details verbatim, omitting the upstream tool hint from the Aru display.
+    lines = [
+        line.removesuffix("细的在 xinchao_context") if line.startswith("另外：") else line
+        for line in body.splitlines()
+    ]
+    return STATE_HEADING + "\n" + "\n".join(lines) + "\n\n【此刻，主人说】\n"
+
+
+def window_key(messages, turn):
+    if turn[4] is None:
+        return transcript_hash("", "session", turn[1])
+    # Aru can omit a conversation ID. Its first user message identifies the window then.
+    first = next(m for m in messages if m.get("role") == "user")
+    return transcript_hash("", "first-user", first.get("content"))
+
+
+async def add_state(messages, turn, scope):
+    turn_id, _, index, _, _ = turn
+    msg = messages[index]
+    original = msg.get("content")
+    if not isinstance(original, (str, list)):
+        return
+    text = as_text(original)
+    if is_bridge_message(text):
+        return
+    try:
+        raw = await asyncio.to_thread(
+            run_now_hook, DB.parent / "now-hook" / scope, turn_id,
+            text.lstrip()[:1], index != len(messages) - 1,
+        )
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        log.warning("Mind hook unavailable for a chat request")
+        return
+    prefix = mind_prefix(raw)
+    if prefix:
+        content = prefix + original if isinstance(original, str) else [
+            {"type": "text", "text": prefix}, *original
+        ]
+        messages[index] = {**msg, "content": content}
+        return prefix
+
+
+class Completion:
+    def __init__(self, db, turn):
+        self.db = db
+        self.turn = turn
+        self.text = []
+        self.reason = None
+        self.tools = False
+
+    def accept(self, chunk, streaming):
+        for choice in chunk.get("choices") or []:
+            if choice.get("index", 0) != 0:
+                continue
+            message = choice.get("delta" if streaming else "message") or {}
+            self.tools |= bool(
+                message.get("tool_calls") or message.get("function_call")
+            )
+            text = as_text(message.get("content"))
+            if text:
+                self.text.append(text)
+            if choice.get("finish_reason"):
+                self.reason = choice["finish_reason"]
+                if streaming:
+                    self.save()
+
+    def save(self):
+        if self.turn and self.reason == "stop" and not self.tools:
+            tid, session, _, question, history = self.turn
+            enqueue(self.db, tid, session, question, "".join(self.text), history)
+
+
+class VisibleChoices:
+    def __init__(self):
+        self.choices = {}
+        self.invalid = False
+
+    def accept(self, chunk, streaming):
+        if "error" in chunk:
+            self.invalid = True
+        for choice in chunk.get("choices") or []:
+            index = choice.get("index", 0)
+            row = self.choices.setdefault(
+                index, {"text": [], "calls": {}, "ids": {}, "finish": None}
+            )
+            msg = choice.get("delta" if streaming else "message") or {}
+            text = as_text(msg.get("content"))
+            if text:
+                row["text"].append(text)
+            if isinstance(msg.get("refusal"), str):
+                row["text"].append(msg["refusal"])
+            calls = msg.get("tool_calls") or []
+            if msg.get("function_call"):
+                calls = [{"function": msg["function_call"]}]
+            for pos, tool in enumerate(calls):
+                if tool.get("id"):
+                    row["ids"][tool.get("index", pos)] = tool["id"]
+                fn = tool.get("function") or {}
+                parts = row["calls"].setdefault(
+                    tool.get("index", pos), {"name": [], "arguments": []}
+                )
+                for field in parts:
+                    if fn.get(field):
+                        parts[field].append(fn[field])
+            if choice.get("finish_reason"):
+                row["finish"] = choice["finish_reason"]
+
+    def calls(self, row, include_id=False):
+        result = []
+        for index, parts in sorted(row["calls"].items()):
+            fn = {key: "".join(value) for key, value in parts.items()}
+            if include_id and index in row["ids"]:
+                fn["id"] = row["ids"][index]
+            result.append(fn)
+        return result
+
+
+class ReplyAudit(VisibleChoices):
+    def __init__(self, directory, record_id):
+        super().__init__()
+        self.directory = directory
+        self.record_id = record_id
+
+    def persist(self):
+        entries = []
+        for index, row in sorted(self.choices.items()):
+            reason = row["finish"] if not self.invalid else None
+            label = "本轮模型回复 · " + (reason or "流未完成")
+            if len(self.choices) > 1:
+                label += f" · 候选 {index + 1}"
+            text = "".join(row["text"])
+            calls = self.calls(row, include_id=True)
+            if calls:
+                text += "\n工具调用\n" + json.dumps(calls, ensure_ascii=False, indent=2)
+            entries.append([None, "assistant", label, text])
+        if not entries:
+            entries.append([None, "assistant", "本轮未收到可见回复", ""])
+        log_reply(self.directory, self.record_id, entries)
+
+
+class OrganizerResult(VisibleChoices):
+    """Keep completed visible model output without retaining the source conversation."""
+
+    def __init__(self, db, body):
+        super().__init__()
+        self.db = db
+        # The same request may be retried with a different streaming transport.
+        semantic = {
+            k: v for k, v in body.items() if k not in ("stream", "stream_options")
+        }
+        encoded = json.dumps(
+            semantic, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        self.request_hash = hashlib.sha256(encoded.encode()).hexdigest()
+        self.model = body["model"]
+        self.expected = body.get("n") or 1
+
+    def save(self):
+        if self.invalid or len(self.choices) != self.expected:
+            return
+        result = []
+        for i, row in sorted(self.choices.items()):
+            if row["finish"] not in ("stop", "tool_calls", "function_call"):
+                return
+            content = "".join(row["text"])
+            calls = self.calls(row)
+            if not content.strip() and not calls:
+                return
+            result.append(
+                {
+                    "index": i,
+                    "finish_reason": row["finish"],
+                    "content": content,
+                    "tool_calls": calls,
+                }
+            )
+        packed = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        digest = hashlib.sha256(packed.encode()).hexdigest()
+        with self.db:
+            self.db.execute(
+                "INSERT INTO aru_organizer_results(request_hash, output_hash, model, output) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(request_hash, output_hash) DO NOTHING",
+                (self.request_hash, digest, self.model, packed),
+            )
+
+
+async def relay(upstream, completed, audit=None):
+    # OpenAI SSE events are UTF-8. Preserve their fields, including usage and tool-call deltas.
+    data = []
+    done = False
+    try:
+        async for line in upstream.aiter_lines():
+            if line.startswith("data:"):
+                data.append(line[5:].lstrip(" "))
+            if not line and data:
+                event = "\n".join(data)
+                data.clear()
+                if event == "[DONE]":
+                    completed.save()
+                    done = True
+                else:
+                    try:
+                        chunk = json.loads(event)
+                        if audit is not None:
+                            audit.accept(chunk, True)
+                        completed.accept(chunk, True)
+                    except (ValueError, TypeError, AttributeError):
+                        if audit is not None:
+                            audit.invalid = True
+                        if isinstance(completed, OrganizerResult):
+                            completed.invalid = True
+            yield (line + "\n").encode()
+        # Some compatible providers end cleanly after their terminal choice.
+        if not done and not data:
+            completed.save()
+    finally:
+        with CancelScope(shield=True):
+            await upstream.aclose()
+            if audit is not None:
+                await asyncio.to_thread(audit.persist)
+
+
+async def models(req):
+    if not authorized(req):
+        return failure(401, "Invalid gateway key.")
+    return JSONResponse(
+        {
+            "object": "list",
+            "data": [{"id": MODEL, "object": "model", "owned_by": "siliconflow"}],
+        }
+    )
+
+
+def apply_siliconflow_effort(body):
+    """Translate the client's effort into V3.2 controls, preserving explicit values."""
+    if body.get("model") != "deepseek-ai/DeepSeek-V3.2" or httpx.URL(CHAT).host not in (
+        "api.siliconflow.cn",
+        "api.siliconflow.com",
+    ):
+        return
+    effort = body.get("reasoning_effort")
+    if effort == "none":
+        body.setdefault("enable_thinking", False)
+    elif isinstance(effort, str) and effort in THINKING_BUDGETS:
+        if body.setdefault("enable_thinking", True) is True:
+            body.setdefault("thinking_budget", THINKING_BUDGETS[effort])
+
+
+async def organize(req: Request):
+    return await chat(req, organizer=True)
+
+
+async def chat(req: Request, *, organizer=False):
+    if not authorized(req):
+        return failure(401, "Invalid gateway key.")
+    key = os.environ.get("XINCHAO_CHAT_API_KEY", "")
+    if not key:
+        return failure(503, "The server's SiliconFlow API key has not been configured.")
+    try:
+        body = await req.json()
+        messages = body["messages"]
+        if (
+            not isinstance(messages, list)
+            or not messages
+            or any(not isinstance(m, dict) for m in messages)
+        ):
+            raise ValueError
+        if body.get("metadata") is not None and not isinstance(body["metadata"], dict):
+            raise ValueError
+        turn = None if organizer else turn_identity(req, body, messages)
+    except (ValueError, TypeError, KeyError):
+        return failure(400, "A valid chat messages array is required.")
+    if body.get("model") != MODEL:
+        return failure(400, f"Select {MODEL}.")
+    apply_siliconflow_effort(body)
+    db = req.app.state.db
+    prefix = None
+    if turn:
+        scope = window_key(messages, turn)
+        if turn[2] == len(messages) - 1:
+            # Aru has no Claude transcript timestamps. Capture the first receipt, before
+            # the model runs, so long generations and queued replies age correctly.
+            user_words = as_text(messages[-1].get("content")).strip()
+            user_scope = scope if user_words and not is_bridge_message(user_words) else None
+            with db:
+                db.execute(
+                    "INSERT OR IGNORE INTO tag_receipts(turn, window, user_at) VALUES(?,?,?)",
+                    (turn[0], user_scope, time.time()),
+                )
+        if INJECT_MIND_STATE:
+            prefix = await add_state(messages, turn, scope)
+    completed = OrganizerResult(db, body) if organizer else Completion(db, turn)
+    client = req.app.state.client
+    sent_at = time.time()
+    try:
+        upstream = await client.send(
+            client.build_request(
+                "POST", CHAT + "/chat/completions", headers=bearer(key), json=body
+            ),
+            stream=True,
+        )
+    except httpx.HTTPError:
+        if not organizer:
+            await asyncio.to_thread(log_request, DB.parent / "prompt-audit", messages,
+                                    turn[2] if turn else None, prefix, sent_at, "上游连接异常，接收未确认")
+        return failure(502, "The chat provider is unavailable.")
+    audit = None
+    if not organizer:
+        directory = DB.parent / "prompt-audit"
+        record_id = await asyncio.to_thread(log_request, directory, messages, turn[2] if turn else None,
+                                            prefix, sent_at, f"模型服务 HTTP {upstream.status_code}")
+        if record_id and upstream.is_success:
+            audit = ReplyAudit(directory, record_id)
+    if upstream.is_success and upstream.headers.get("content-type", "").startswith(
+        "text/event-stream"
+    ):
+        return StreamingResponse(
+            relay(upstream, completed, audit),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
+    try:
+        raw = await upstream.aread()
+        if upstream.is_success:
+            chunk = json.loads(raw)
+            if audit is not None:
+                audit.accept(chunk, False)
+                await asyncio.to_thread(audit.persist)
+            completed.accept(chunk, False)
+            completed.save()
+        return Response(
+            raw,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type", "application/json"),
+        )
+    finally:
+        await upstream.aclose()
+
+
+class AnalysisFormatError(ValueError):
+    pass
+
+
+def save(db, sql, *params):
+    with db:
+        db.execute(sql, params)
+
+
+async def model_json(client, key_id, prompt, content, max_tokens, *, object_output):
+    key = os.environ.get("XINCHAO_ANALYSIS_API_KEY") or os.environ.get(
+        "XINCHAO_CHAT_API_KEY", ""
+    )
+    if not key:
+        raise RuntimeError("provider key missing")
+    payload = {
+        "model": ANALYSIS_MODEL,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": content},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "enable_thinking": False,
+    }
+    # OB's official prompt requests a top-level JSON array.
+    if object_output:
+        payload["response_format"] = {"type": "json_object"}
+    r = await client.post(
+        ANALYSIS + "/chat/completions",
+        headers={**bearer(key), "Idempotency-Key": key_id},
+        json=payload,
+    )
+    r.raise_for_status()
+    choice = r.json()["choices"][0]
+    if choice.get("finish_reason") != "stop":
+        raise AnalysisFormatError("incomplete model response")
+    try:
+        return json.loads(ob_import.clean_llm_json(choice["message"]["content"]))
+    except (TypeError, KeyError, ValueError) as exc:
+        raise AnalysisFormatError("invalid JSON response") from exc
+
+
+def clear_delivered(db, turns):
+    db.executemany(
+        """UPDATE turns SET state='done',question='',answer='' WHERE id=? AND mind_done=1
+           AND memory_planned=1 AND NOT EXISTS (SELECT 1 FROM memory_parts WHERE turn=turns.id)""",
+        ((tid,) for tid in turns),
+    )
+
+
+def emotion_exchange(question, answer):
+    def excerpt(text, budget):
+        if len(text) <= budget:
+            return text
+        marker = "\n［中间已省略］\n"
+        visible = budget - len(marker)
+        head = visible // 2
+        return text[:head] + marker + text[-(visible - head) :]
+
+    budget = EMOTION_CHAR_LIMIT - len("她说：\n他回：")
+    question_budget = min(
+        len(question), budget - min(len(answer), EMOTION_REPLY_RESERVE)
+    )
+    return (
+        "她说："
+        + excerpt(question, question_budget)
+        + "\n他回："
+        + excerpt(answer, budget - question_budget)
+    )
+
+
+def reserve_stop_tag(db, turn, question, now):
+    """Apply the official Stop hook's sending rules before the server-side cooldown."""
+    if not question.strip() or is_bridge_message(question):
+        return False
+    with db:
+        # The write also serializes concurrent decisions and preserves a retry's slot.
+        db.execute("INSERT OR IGNORE INTO tag_receipts(turn) VALUES(?)", (turn,))
+        window, user_at, sent_at = db.execute(
+            "SELECT window,user_at,sent_at FROM tag_receipts WHERE turn=?", (turn,)
+        ).fetchone()
+        if user_at is not None and (window is None or now - user_at > 45 * 60):
+            return False
+        if sent_at is not None:
+            return True
+        previous = db.execute(
+            "SELECT MAX(user_at) FROM tag_receipts WHERE window=? AND user_at<?",
+            (window, user_at),
+        ).fetchone()[0]
+        returning = previous is not None and user_at - previous >= TAG_ARRIVAL_SECONDS
+        if not returning:
+            count, latest = db.execute(
+                "SELECT COUNT(*), MAX(sent_at) FROM tag_receipts WHERE sent_at>?",
+                (now - 3600,),
+            ).fetchone()
+            if count >= TAG_HOURLY_MAX or (latest is not None and now - latest < TAG_GAP_SECONDS):
+                return False
+        db.execute("UPDATE tag_receipts SET sent_at=? WHERE turn=?", (now, turn))
+        return True
+
+
+def finish_mind_turn(db, turn):
+    with db:
+        db.execute(
+            "UPDATE turns SET mind_done=1,state='buffered',mode=NULL,result=NULL,error=NULL WHERE id=?",
+            (turn,),
+        )
+        clear_delivered(db, [turn])
+
+
+async def process_turn(app, row):
+    db, client = app.state.db, app.state.client
+    turn, mode = row["id"], row["mode"]
+    headers = bearer(os.environ["NIAN_MIND_TOKEN"])
+    if mode is None:
+        if not reserve_stop_tag(db, turn, row["question"], time.time()):
+            finish_mind_turn(db, turn)
+            return
+        r = await client.get(
+            MIND + "/v1/interaction-classification/due", headers=headers
+        )
+        r.raise_for_status()
+        due = r.json()["due"]
+        if not isinstance(due, bool):
+            raise ValueError("invalid classification status")
+        mode = "classify" if due else "presence"
+        save(db, "UPDATE turns SET mode=? WHERE id=?", mode, turn)
+    event = {"event_id": turn, "session_id": row["session"]}
+    if mode == "classify":
+        exchange = "她说：" + row["question"] + "\n他回：" + row["answer"]
+        if row["result"] is None:
+            tag = await model_json(
+                client,
+                "emotion-" + turn,
+                INTERACTION_PROMPT,
+                emotion_exchange(row["question"], row["answer"]),
+                256,
+                object_output=True,
+            )
+            if not isinstance(tag, dict) or not isinstance(tag.get("type"), str):
+                raise AnalysisFormatError("invalid interaction")
+            save(
+                db,
+                "UPDATE turns SET result=?,failures=0 WHERE id=?",
+                json.dumps(tag, ensure_ascii=False),
+                turn,
+            )
+        else:
+            tag = json.loads(row["result"])
+        event.update(exchange=exchange, gateway_classification=tag)
+    else:
+        event["her_words"] = row["question"][:80]
+    r = await client.post(MIND + "/v1/conversation-event", headers=headers, json=event)
+    r.raise_for_status()
+    finish_mind_turn(db, turn)
+
+
+def memory_candidates(db, tip):
+    if tip["group_id"] is not None:
+        return db.execute(
+            """SELECT * FROM turns WHERE group_id=? AND memory_planned=0
+               AND rowid<=(SELECT rowid FROM turns WHERE id=?) ORDER BY rowid""",
+            (tip["group_id"], tip["id"]),
+        )
+    return db.execute(
+        """WITH RECURSIVE ancestors(id) AS (
+              SELECT ? UNION ALL SELECT t.parent_id FROM turns t JOIN ancestors a ON t.id=a.id
+              WHERE t.parent_id IS NOT NULL)
+           SELECT t.* FROM turns t JOIN ancestors a ON t.id=a.id
+           WHERE t.memory_planned=0 ORDER BY t.rowid""",
+        (tip["id"],),
+    )
+
+
+def memory_text(row, start, end):
+    question, answer = row["question"], row["answer"]
+    lines = []
+    if start < len(question):
+        lines.append("[用户] " + question[start:end])
+    if end > len(question):
+        lines.append(
+            "[AI] " + answer[max(0, start - len(question)) : end - len(question)]
+        )
+    return "\n".join(lines)
+
+
+def fit_fragment(row, start, chars, tokens):
+    """Prefer a whole exchange; bound an oversized exchange without dropping its suffix."""
+    length = len(row["question"]) + len(row["answer"])
+    upper = min(length, start + chars)
+
+    def fits(end):
+        text = memory_text(row, start, end)
+        return len(text) <= chars and ob_import.count_tokens_approx(text) <= tokens
+
+    if upper > start and fits(upper):
+        return upper
+    lower = start
+    while lower < upper:
+        mid = (lower + upper + 1) // 2
+        if fits(mid):
+            lower = mid
+        else:
+            upper = mid - 1
+    return lower
+
+
+def reserve_parts(db, job, parts, result=None):
+    db.execute("INSERT INTO memory_jobs(id,result) VALUES(?,?)", (job, result))
+    db.executemany(
+        "INSERT INTO memory_parts(job,turn,start,stop) VALUES(?,?,?,?)",
+        ((job, tid, start, stop) for tid, start, stop, full in parts),
+    )
+    db.executemany(
+        "UPDATE turns SET memory_offset=?,memory_planned=? WHERE id=?",
+        ((stop, full, tid) for tid, start, stop, full in parts),
+    )
+
+
+def plan_memory(db, tip):
+    remaining_chars, remaining_tokens = MEMORY_CHAR_LIMIT, MEMORY_TARGET_TOKENS
+    parts = []
+    for row in memory_candidates(db, tip):
+        start = row["memory_offset"]
+        length = len(row["question"]) + len(row["answer"])
+        if parts:
+            remaining_chars -= 1  # newline between adjacent excerpts
+        end = fit_fragment(row, start, remaining_chars, remaining_tokens)
+        if end > start:
+            text = memory_text(row, start, end)
+            parts.append((row["id"], start, end, end == length))
+            remaining_chars -= len(text)
+            remaining_tokens -= ob_import.count_tokens_approx(text)
+        if end < length or remaining_chars == 0 or remaining_tokens == 0:
+            job = hashlib.sha256(
+                ("ob-memory:" + json.dumps(parts)).encode()
+            ).hexdigest()
+            with db:
+                reserve_parts(db, job, parts)
+            # Recheck this transcript after reserving a full slice to drain long inputs.
+            return job
+    save(db, "UPDATE turns SET memory_check=0 WHERE id=?", tip["id"])
+    return None
+
+
+async def process_memory(app, row):
+    db, client, job = app.state.db, app.state.client, row["id"]
+    parts = db.execute(
+        """SELECT t.id,t.question,t.answer,p.start,p.stop FROM memory_parts p JOIN turns t ON t.id=p.turn
+           WHERE p.job=? ORDER BY t.rowid""",
+        (job,),
+    ).fetchall()
+    if row["result"] is None:
+        content = "\n".join(
+            memory_text(part, part["start"], part["stop"]) for part in parts
+        )
+        items = await model_json(
+            client,
+            "memory-" + job,
+            ob_import.IMPORT_EXTRACT_PROMPT,
+            content,
+            ob_import._EXTRACT_MAX_TOKENS,
+            object_output=False,
+        )
+        if (
+            not isinstance(items, list)
+            or len(items) > 5
+            or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("content"), str)
+                or not item["content"].strip()
+                for item in items
+            )
+        ):
+            raise AnalysisFormatError("invalid memory array")
+        save(
+            db,
+            "UPDATE memory_jobs SET result=?,failures=0 WHERE id=?",
+            json.dumps(items, ensure_ascii=False),
+            job,
+        )
+    else:
+        items = json.loads(row["result"])
+    if items:
+        r = await client.post(
+            OB + "/internal/gateway/memories",
+            headers=bearer(os.environ["NIAN_INTERNAL_TOKEN"]),
+            json={"turn_id": job, "memories": items},
+        )
+        r.raise_for_status()
+    with db:
+        db.execute("DELETE FROM memory_parts WHERE job=?", (job,))
+        db.execute("DELETE FROM memory_jobs WHERE id=?", (job,))
+        clear_delivered(db, (part["id"] for part in parts))
+
+
+async def run_job(app, table, row, process):
+    try:
+        await process(app, row)
+    except Exception as exc:
+        status = (
+            exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else 0
+        )
+        reason = type(exc).__name__ + (f"-{status}" if status else "")
+        db = app.state.db
+        # The model result may have been saved and its failure counter reset during this attempt.
+        attempts = (
+            db.execute(
+                f"SELECT failures FROM {table} WHERE id=?", (row["id"],)
+            ).fetchone()[0]
+            + 1
+        )
+        permanent = status in (400, 404, 413, 422) or attempts >= 10
+        save(
+            db,
+            f"UPDATE {table} SET state=?,available=?,failures=?,error=? WHERE id=?",
+            "failed" if permanent else "pending",
+            time.time() + min(1800, 5 * 2 ** min(attempts, 9)),
+            attempts,
+            reason,
+            row["id"],
+        )
+        log.warning("%s %s: %s", table, row["id"][:12], reason)
+
+
+async def emotion_worker(app):
+    while True:
+        row = app.state.db.execute(
+            "SELECT * FROM turns WHERE state='pending' ORDER BY rowid LIMIT 1"
+        ).fetchone()
+        if row is None or row["available"] > time.time():
+            await asyncio.sleep(0.4)
+            continue
+        await run_job(app, "turns", row, process_turn)
+
+
+async def memory_worker(app):
+    db = app.state.db
+    while True:
+        job = db.execute(
+            "SELECT * FROM memory_jobs WHERE state='pending' AND available<=? ORDER BY rowid LIMIT 1",
+            (time.time(),),
+        ).fetchone()
+        if job is not None:
+            await run_job(app, "memory_jobs", job, process_memory)
+            continue
+        tip = db.execute(
+            "SELECT id,group_id FROM turns WHERE memory_check=1 ORDER BY rowid LIMIT 1"
+        ).fetchone()
+        if tip is None:
+            await asyncio.sleep(0.4)
+        else:
+            plan_memory(db, tip)
+            await asyncio.sleep(0)
+
+
+def migrate_joint_results(db):
+    # A cached joint response already paid for both tasks. Keep its OB receipt ID on replay.
+    db.execute("UPDATE turns SET memory_check=0,memory_planned=1 WHERE state='done'")
+    for owner in db.execute("SELECT * FROM turns WHERE result IS NOT NULL").fetchall():
+        old = json.loads(owner["result"])
+        tid = owner["id"]
+        if owner["mode"] != "classify":
+            members = db.execute(
+                "SELECT * FROM turns WHERE batch=? ORDER BY rowid", (tid,)
+            ).fetchall() or [owner]
+            parts = []
+            for item in members:
+                length = len(item["question"]) + len(item["answer"])
+                stop = item["end_offset"]
+                if stop is None or stop == -1:
+                    stop = length
+                parts.append((item["id"], item["memory_offset"], stop, stop == length))
+            reserve_parts(
+                db, tid, parts, json.dumps(old["memories"], ensure_ascii=False)
+            )
+        db.execute(
+            "UPDATE turns SET mode='classify',result=? WHERE id=?",
+            (json.dumps(old["interaction"], ensure_ascii=False), tid),
+        )
+    db.execute("UPDATE turns SET mode='classify' WHERE mode='analyze'")
+    db.execute(
+        "UPDATE turns SET state='buffered',mode=NULL,result=NULL WHERE mind_done=1 AND state IN ('pending','failed')"
+    )
+    db.execute("UPDATE turns SET batch=NULL,end_offset=NULL WHERE batch IS NOT NULL")
+
+
+def setup_queue(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS turns(
+        id TEXT PRIMARY KEY, session TEXT NOT NULL, question TEXT NOT NULL, answer TEXT NOT NULL,
+        result TEXT, mind_done INTEGER DEFAULT 0, state TEXT DEFAULT 'pending', available REAL DEFAULT 0,
+        failures INTEGER DEFAULT 0, error TEXT)""")
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("""CREATE TABLE IF NOT EXISTS aru_organizer_results(
+            request_hash TEXT NOT NULL, output_hash TEXT NOT NULL, model TEXT NOT NULL,
+            output TEXT NOT NULL, saved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(request_hash, output_hash))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS tag_receipts(
+            turn TEXT PRIMARY KEY, window TEXT, user_at REAL, sent_at REAL)""")
+        db.execute("CREATE INDEX IF NOT EXISTS tag_window_time ON tag_receipts(window,user_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS tag_sent_time ON tag_receipts(sent_at) WHERE sent_at IS NOT NULL")
+        columns = {r[1] for r in db.execute("PRAGMA table_info(turns)")}
+        additions = {
+            "group_id": "TEXT",
+            "anchor": "TEXT",
+            "parent_id": "TEXT",
+            "mode": "TEXT",
+            "batch": "TEXT",
+            "end_offset": "INTEGER",
+            "memory_planned": "INTEGER NOT NULL DEFAULT 0",
+            "memory_check": "INTEGER NOT NULL DEFAULT 1",
+            "memory_offset": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, kind in additions.items():
+            if name not in columns:
+                db.execute(f"ALTER TABLE turns ADD COLUMN {name} {kind}")
+        if "group_id" not in columns:
+            db.execute(
+                "UPDATE turns SET group_id=session WHERE state='pending' AND session!='personal'"
+            )
+        db.execute("""CREATE TABLE IF NOT EXISTS memory_jobs(id TEXT PRIMARY KEY,result TEXT,
+                   state TEXT NOT NULL DEFAULT 'pending',available REAL NOT NULL DEFAULT 0,
+                   failures INTEGER NOT NULL DEFAULT 0,error TEXT)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS memory_parts(job TEXT NOT NULL,turn TEXT NOT NULL,
+                   start INTEGER NOT NULL,stop INTEGER NOT NULL,PRIMARY KEY(job,turn))""")
+        db.execute("CREATE INDEX IF NOT EXISTS memory_parts_turn ON memory_parts(turn)")
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS turns_unread ON turns(group_id) WHERE memory_planned=0"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS turns_checks ON turns(memory_check) WHERE memory_check=1"
+        )
+        if "memory_planned" not in columns:
+            migrate_joint_results(db)
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS turns_anchor ON turns(anchor) WHERE anchor IS NOT NULL"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS turns_buffer ON turns(group_id) WHERE state='buffered'"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS turns_batch ON turns(batch) WHERE batch IS NOT NULL"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS turns_work ON turns(state) WHERE state='pending'"
+        )
+
+
+@asynccontextmanager
+async def lifespan(app):
+    os.umask(0o077)
+    db = sqlite3.connect(DB)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA secure_delete=ON")
+    setup_queue(db)
+    app.state.db = db
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(150, connect=12), trust_env=False
+    ) as client:
+        app.state.client = client
+        tasks = [asyncio.create_task(emotion_worker(app))]
+        if CHAT_MEMORY_IMPORT:
+            tasks.append(asyncio.create_task(memory_worker(app)))
+        try:
+            yield
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            db.close()
+
+
+app = Starlette(
+    routes=[
+        Route("/v1/models", models),
+        Route("/v1/chat/completions", chat, methods=["POST"]),
+        Route("/aru-memory/v1/models", models),
+        Route("/aru-memory/v1/chat/completions", organize, methods=["POST"]),
+    ],
+    lifespan=lifespan,
+)

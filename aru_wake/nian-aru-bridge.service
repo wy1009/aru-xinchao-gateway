@@ -1,0 +1,23 @@
+[Unit]
+Description=Deliver Xinchao cabin notifications to the configured collaborator in Aru
+After=nian-mind.service aru-selfhost.service nian-aru-receipt.socket
+Requires=nian-aru-receipt.socket
+Wants=nian-mind.service aru-selfhost.service
+[Service]
+User=nian-aru-bridge
+Group=nian-aru-bridge
+WorkingDirectory=/opt/xinchao-nian/aru-wake
+EnvironmentFile=/etc/nian-aru-bridge/bridge.env
+ExecStart=/usr/local/bin/node runtime/src/cli.js run
+StateDirectory=nian-aru-bridge
+StateDirectoryMode=0700
+Restart=always
+RestartSec=4s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+PrivateDevices=yes
+UMask=0077
+[Install]
+WantedBy=multi-user.target

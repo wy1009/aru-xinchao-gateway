@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aru 备份同步</title>
+<style>
+:root{font:16px Inter,"PingFang SC",system-ui,sans-serif;color:#253731;background:#f6f6f0;color-scheme:light}
+*{box-sizing:border-box}body{margin:0}main{max-width:35rem;margin:clamp(2.5rem,12vh,7rem) auto;padding:0 1.25rem}
+h1{font-size:clamp(2rem,6vw,2.7rem);letter-spacing:-.05em;margin:0}p{line-height:1.65}
+h2{font-size:1.2rem;margin:.1rem 0 .5rem}section{background:#fff;border:1px solid #d7dfd6;border-radius:1.1rem;padding:1.35rem;margin:1.5rem 0 1rem}
+label{display:block;font-weight:650}input{display:block;width:100%;margin:1rem 0 1.25rem;font:inherit}
+button,input::file-selector-button{font:inherit;border-radius:.55rem;padding:.6rem .9rem;border:1px solid #bbc9c0;cursor:pointer}
+button{background:#205b49;color:white;border:0;min-height:2.8rem}button:disabled{background:#62736b;cursor:default}
+progress{width:100%;accent-color:#205b49}#last,#note{color:#45584c}#last{white-space:pre-line}p:empty{display:none}
+</style></head><body><main><h1>Aru 备份同步</h1><p>将协作者的结构化记忆、长期资料、信息卡和条目记忆同步到 OB。</p>
+<section><label for="file">Aru 备份文件</label><input id="file" type="file"><button id="upload" disabled>上传并同步</button>
+<p id="note">请选择 .polarisarchive 文件，上传完成前请保持此页打开。</p><progress id="progress" max="100" value="0" hidden></progress><p id="status" role="status"></p></section><p id="last"></p>
+<section><h2>AI 补全记忆</h2><p>上传同步后，DeepSeek 会为协作者新增或改动的记忆补充主题标签、重要性和情绪坐标，并在 OB 正文中标出专名双链。</p>
+<button id="enrich" type="button">补全待处理记忆</button><p id="ai-status" role="status">正在读取进度…</p></section><p><a href="/aru-backup/xinchao-log">心潮消息日志</a></p></main>
+<script>
+const $=id=>document.getElementById(id),file=$('file'),button=$('upload'),status=$('status'),last=$('last'),progress=$('progress');
+const enrichButton=$('enrich'),aiStatus=$('ai-status');
+let posting=false;
+const base=location.pathname.replace(/\/$/,'');
+let sending=false, busy=false, polling=false, feedback='';
+const updateButton=()=>{button.disabled=sending||busy||!file.files.length};
+file.onchange=()=>{feedback='';updateButton()};
+async function refresh(){
+  if(polling||sending)return;
+  polling=true;
+  try{
+    const response=await fetch(base+'/status',{cache:'no-store'});
+    if(!response.ok)throw new Error();
+    const {state,last:result,ai}=await response.json();
+    const tally=Number.isInteger(ai.done)?' · '+ai.done+' / '+ai.total+' 条':'';
+    const labels={idle:'可以直接处理已入库的记忆。',queued:'已排队',running:'正在补全',done:'已全部补全',failed:'补全中断，可点击按钮继续'};
+    aiStatus.textContent=(labels[ai.state]||'等待处理')+tally;
+    enrichButton.disabled=posting||['running','queued'].includes(ai.state);
+    if(sending)return;
+    busy=state!=='ready';
+    const message={syncing:'上传完成，服务器正在同步。可以关闭此页，稍后回来查看结果。',uploading:'正在接收备份。'};
+    status.textContent=message[state]||feedback;
+    if(result){
+      const time=new Date(result.at).toLocaleString('zh-CN',{hour12:false});
+      const c=result.changes;
+      last.textContent=result.ok?'上次同步完成 · '+time+'\n新增 '+c.create+'，更新 '+c.update+'，归档 '+c.archive+'，恢复 '+c.restore+'，未变 '+c.unchanged+(result.skipped.length?'\n本次跳过：'+result.skipped.join('、'):''):'上次同步失败 · '+time+'\n'+result.message;
+    }
+  }catch{if(!sending)status.textContent='暂时无法获取状态，可刷新页面重试。'}
+  finally{polling=false;updateButton()}
+}
+enrichButton.onclick=async()=>{
+  if(posting)return;
+  posting=true;enrichButton.disabled=true;
+  try{
+    const resp=await fetch(base+'/enrich',{method:'POST',headers:{'X-Aru-Upload':'1'}});
+    if(!resp.ok)throw new Error();
+    aiStatus.textContent='已排队';
+  }catch{aiStatus.textContent='提交失败，请重试。'}
+  finally{posting=false;enrichButton.disabled=false;refresh()}
+};
+button.onclick=()=>{
+  if(sending||busy||!file.files.length)return;
+  const selected=file.files[0];
+  if(!selected.name.toLowerCase().endsWith('.polarisarchive')){status.textContent=feedback='请选择 .polarisarchive 文件。';return}
+  sending=true;updateButton();progress.value=0;progress.hidden=false;feedback='';file.disabled=true;
+  const x=new XMLHttpRequest();x.open('POST',base+'/upload');x.setRequestHeader('Content-Type','application/octet-stream');x.setRequestHeader('X-Aru-Upload','1');
+  status.textContent='开始上传…';
+  x.upload.onprogress=e=>{if(e.lengthComputable){progress.value=e.loaded/e.total*100;status.textContent='已上传 '+Math.floor(progress.value)+'%'}};
+  x.onloadend=()=>{sending=false;file.disabled=false;progress.hidden=true;if(x.status===201){file.value='';feedback=''}else{feedback=(x.status&&x.status<500&&x.responseText.length<160?x.responseText:'')||'传输中断，请重试。'}status.textContent=feedback;updateButton();refresh()};
+  x.send(selected);
+};
+refresh();setInterval(()=>{if(!document.hidden)refresh()},3500);document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh()});
+</script></body></html>

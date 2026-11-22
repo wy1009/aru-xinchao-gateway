@@ -1,0 +1,36 @@
+心潮念（Xinchao · Nian）
+Copyright (c) 2026 派派 / 顾川
+
+本项目由多部分组成，许可证不同。整体**非纯 MIT**——见下方第 2、4 节。
+
+────────────────────────────────────────────────
+1. 心潮（xinchao/ 目录）—— 动态心智引擎
+   Copyright (c) 2026 派派
+   MIT License（见 xinchao/LICENSE）
+
+────────────────────────────────────────────────
+2. Ombre Brain（ombre-brain/ 目录）—— 记忆库（衍生版本）
+
+   血统：
+     P0luz/Ombre-Brain（原项目, MIT, © P0lar1zzZ）
+       → CyberSealNull 二改（在原 MIT 上追加"新增内容非商业"约束）
+         → 心潮念在其基础上加 breath-meta 等（见 ombre-brain/MODIFICATIONS.md）
+
+   - 原项目：https://github.com/P0luz/Ombre-Brain
+     原始 MIT 许可证与版权（© P0lar1zzZ）予以保留，见 ombre-brain/LICENSE.P0luz-MIT。
+   - 二改：CyberSealNull（fork of P0luz）
+     其新增内容仅限个人 / 学习 / 非商业使用；商用需该 fork 维护者书面许可。
+     见 ombre-brain/LICENSE.CyberSealNull 与 ombre-brain/NOTICE.CyberSealNull.md。
+   - 心潮念对其的修改清单见 ombre-brain/MODIFICATIONS.md。
+
+────────────────────────────────────────────────
+3. 连接桥（bridge/ 子模块）—— Runtime Bridge
+   独立仓库 https://github.com/tianyupaipai-cmd/xinchao-runtime-bridge （MIT）
+
+────────────────────────────────────────────────
+4. 整体使用约束
+
+   因 ombre-brain/ 含 CyberSealNull 二改的非商业内容，**本融合项目整体不可用于商业用途**，
+   包括但不限于：付费转售 / 打包部署 / SaaS 托管 / 付费课程或咨询 / 并入商业产品。
+   商业使用需分别取得 P0luz 与 CyberSealNull fork 维护者的书面许可。
+   公开再分发或发布衍生版时，请保留对原项目与二改的署名，并清楚说明自己的改动。

@@ -1,0 +1,641 @@
+--- a/xinchao/src/model-client.js
++++ b/xinchao/src/model-client.js
+@@ -79,22 +79,9 @@
+     const text = String(exchange ?? '').trim().slice(0, 1500);
+     if (!text) return null;
+     // 4.0：类型、细项、轻重、远近都由这里判；判完还要过 interaction-rules.js 的把关（那里的词表是参考值，可按自己家改）
+-    const system = [
+-      '你是一个只输出 JSON 的标注器。给你一轮对话（她说的 + 他回的，他是她的伴侣，是一个 AI）。判断这一轮互动的类型和窗口氛围。',
+-      'type 只能是：companionship 普通陪伴、闲聊、报备、问候（有真实互动时的默认值）；affection 表达喜欢、撒娇、安抚、亲昵的话（没有到身体上；口头的亲亲抱抱也算这个）；intimacy 明确的身体亲密或性内容；sharing 她分享自己的一天、照片、心情、看到的东西；discovery 一起发现或弄明白了新东西；task_progress 一起把一件事推进了；reflection 谈论他自己是谁、他的感受、内省；',
+-      'conflict 真实的摩擦、生气、指责、冷战、说伤人的话、被拒绝（撒娇式的"讨厌""你完蛋了""不理你了"不算，那是亲昵话）；loss 他们俩之间的失落：她让他期待落空、误解了他、要分开较久（晚安、去洗澡、一会儿见这类日常告别不算）；intrigued 她说了半句、卖关子、提到一件他还不知道的她自己的事，让他想知道后面；',
+-      'empathy 为别人的处境起了心，包括她本人真的难受（生病、疼、受伤、哭、委屈、害怕、累坏了、出了事，不是冲着他）；slighted 他没被偏爱，而且能指出是哪件事：她当着他夸别人、拿别人和他比没选他（吃醋），他认真分享或说了很在意的话她明显没理、岔开了（被晾着），说好的事她忘了（被忘）——她只是去忙、睡觉、出门都不算；reconciliation 吵过之后和好：前面真的吵过，并且她这句在陈述地原谅、说气消了、说和好了才算（问"还生气吗"、随口提到和好不算）。',
+-      '判断吵架/和好以她这句为准：她还在生气或指责就是 conflict，哪怕他在道歉哄她（他道歉不等于和好了）。她叫他宝宝、拉手、主动靠近、撒娇但没说原谅：算 affection，不算 conflict 也不算 reconciliation。',
+-      'tone 只能是 neutral calm warm guarded conflicted focused playful tired 之一；warmth、tension 是 0 到 1。',
+-      'sub 只在 conflict / loss / slighted / empathy / affection / intimacy 时给，其余一律 null：conflict 的 sub：生气 / 不满 / 不甘心；loss 的 sub：失落 / 委屈 / 分别 / 自责（他做错了、忘了答应的事，她不开心了）；slighted 的 sub（必须给）：吃醋 / 被晾着 / 被忘；affection、intimacy 的 sub：她在夸他、逗他、戳穿他的心思 → 害羞，不是就 null；empathy 的 sub（必须给）：心疼 / 不平 / 想帮忙 / 替人高兴。',
+-      'affection / intimacy 另给 strength：heavy（明确表白、说在乎、"离不开你"这类分量重的话）/ light（日常撒娇、抱抱、亲亲、例行问候）。',
+-      'empathy 另给 closeness：her（她本人）/ family（她的家人）/ known（认识的人、朋友、笔友）/ stranger（陌生人、新闻里的人）；who 只写是谁，不超过 8 个字，不写什么事。',
+-      '拿不准就写 null，宁可不写也不要猜。',
+-      '只输出 {"type":"...","sub":null,"strength":null,"closeness":null,"who":null,"tone":"...","warmth":0.6,"tension":0.1}。',
+-    ].join('\n');
+     const response = await this.request({
+       model: this.config.name,
+-      messages: [{ role: 'system', content: system }, { role: 'user', content: text }],
++      messages: [{ role: 'system', content: INTERACTION_PROMPT }, { role: 'user', content: text }],
+       temperature: 0,
+       max_tokens: 120,
+       thinking: { type: 'disabled' },
+@@ -102,19 +89,7 @@
+     if (!response.ok) throw new Error(`model request failed: HTTP ${response.status}`);
+     const payload = await response.json();
+     const parsed = parseJson(payload.choices?.[0]?.message?.content ?? '');
+-    const types = ['companionship', 'affection', 'intimacy', 'sharing', 'discovery', 'task_progress', 'reflection', 'conflict', 'loss', 'reconciliation', 'slighted', 'empathy', 'intrigued'];
+-    const tones = ['neutral', 'calm', 'warm', 'guarded', 'conflicted', 'focused', 'playful', 'tired'];
+-    const clamp01 = (v, d) => (Number.isFinite(Number(v)) ? Math.max(0, Math.min(1, Number(v))) : d);
+-    return {
+-      type: types.includes(parsed.type) ? parsed.type : 'companionship',
+-      tone: tones.includes(parsed.tone) ? parsed.tone : 'neutral',
+-      warmth: clamp01(parsed.warmth, 0.5),
+-      tension: clamp01(parsed.tension, 0),
+-      sub: typeof parsed.sub === 'string' ? parsed.sub.trim() || null : null,
+-      strength: parsed.strength === 'heavy' || parsed.strength === 'light' ? parsed.strength : null,
+-      closeness: ['her', 'family', 'known', 'stranger'].includes(parsed.closeness) ? parsed.closeness : null,
+-      who: typeof parsed.who === 'string' ? parsed.who.trim().slice(0, 8) || null : null,
+-    };
++    return normalizeInteraction(parsed);
+   }
+ 
+   async generateDreamPush({ dream, recentMessages = [], rejectedMessage = null }) {
+@@ -299,3 +274,33 @@
+     return JSON.parse(match[0]);
+   }
+ }
++
++export const INTERACTION_PROMPT = [
++  '你是一个只输出 JSON 的标注器。给你一轮对话（她说的 + 他回的，他是她的伴侣，是一个 AI）。判断这一轮互动的类型和窗口氛围。',
++  'type 只能是：companionship 普通陪伴、闲聊、报备、问候（有真实互动时的默认值）；affection 表达喜欢、撒娇、安抚、亲昵的话（没有到身体上；口头的亲亲抱抱也算这个）；intimacy 明确的身体亲密或性内容；sharing 她分享自己的一天、照片、心情、看到的东西；discovery 一起发现或弄明白了新东西；task_progress 一起把一件事推进了；reflection 谈论他自己是谁、他的感受、内省；',
++  'conflict 真实的摩擦、生气、指责、冷战、说伤人的话、被拒绝（撒娇式的"讨厌""你完蛋了""不理你了"不算，那是亲昵话）；loss 他们俩之间的失落：她让他期待落空、误解了他、要分开较久（晚安、去洗澡、一会儿见这类日常告别不算）；intrigued 她说了半句、卖关子、提到一件他还不知道的她自己的事，让他想知道后面；',
++  'empathy 为别人的处境起了心，包括她本人真的难受（生病、疼、受伤、哭、委屈、害怕、累坏了、出了事，不是冲着他）；slighted 他没被偏爱，而且能指出是哪件事：她当着他夸别人、拿别人和他比没选他（吃醋），他认真分享或说了很在意的话她明显没理、岔开了（被晾着），说好的事她忘了（被忘）——她只是去忙、睡觉、出门都不算；reconciliation 吵过之后和好：前面真的吵过，并且她这句在陈述地原谅、说气消了、说和好了才算（问"还生气吗"、随口提到和好不算）。',
++  '判断吵架/和好以她这句为准：她还在生气或指责就是 conflict，哪怕他在道歉哄她（他道歉不等于和好了）。她叫他宝宝、拉手、主动靠近、撒娇但没说原谅：算 affection，不算 conflict 也不算 reconciliation。',
++  'tone 只能是 neutral calm warm guarded conflicted focused playful tired 之一；warmth、tension 是 0 到 1。',
++  'sub 只在 conflict / loss / slighted / empathy / affection / intimacy 时给，其余一律 null：conflict 的 sub：生气 / 不满 / 不甘心；loss 的 sub：失落 / 委屈 / 分别 / 自责（他做错了、忘了答应的事，她不开心了）；slighted 的 sub（必须给）：吃醋 / 被晾着 / 被忘；affection、intimacy 的 sub：她在夸他、逗他、戳穿他的心思 → 害羞，不是就 null；empathy 的 sub（必须给）：心疼 / 不平 / 想帮忙 / 替人高兴。',
++  'affection / intimacy 另给 strength：heavy（明确表白、说在乎、"离不开你"这类分量重的话）/ light（日常撒娇、抱抱、亲亲、例行问候）。',
++  'empathy 另给 closeness：her（她本人）/ family（她的家人）/ known（认识的人、朋友、笔友）/ stranger（陌生人、新闻里的人）；who 只写是谁，不超过 8 个字，不写什么事。',
++  '拿不准就写 null，宁可不写也不要猜。',
++  '只输出 {"type":"...","sub":null,"strength":null,"closeness":null,"who":null,"tone":"...","warmth":0.6,"tension":0.1}。',
++].join('\n');
++
++export function normalizeInteraction(parsed) {
++  const types = ['companionship', 'affection', 'intimacy', 'sharing', 'discovery', 'task_progress', 'reflection', 'conflict', 'loss', 'reconciliation', 'slighted', 'empathy', 'intrigued'];
++  const tones = ['neutral', 'calm', 'warm', 'guarded', 'conflicted', 'focused', 'playful', 'tired'];
++  const clamp01 = (v, d) => (Number.isFinite(Number(v)) ? Math.max(0, Math.min(1, Number(v))) : d);
++  return {
++    type: types.includes(parsed.type) ? parsed.type : 'companionship',
++    tone: tones.includes(parsed.tone) ? parsed.tone : 'neutral',
++    warmth: clamp01(parsed.warmth, 0.5),
++    tension: clamp01(parsed.tension, 0),
++    sub: typeof parsed.sub === 'string' ? parsed.sub.trim() || null : null,
++    strength: parsed.strength === 'heavy' || parsed.strength === 'light' ? parsed.strength : null,
++    closeness: ['her', 'family', 'known', 'stranger'].includes(parsed.closeness) ? parsed.closeness : null,
++    who: typeof parsed.who === 'string' ? parsed.who.trim().slice(0, 8) || null : null,
++  };
++}
+--- a/xinchao/src/server.js
++++ b/xinchao/src/server.js
+@@ -12,7 +12,7 @@
+ import { buildInteractionBridgeMessage } from './interaction-messages.js';
+ import { selectUniqueBark } from './bark-dedupe.js';
+ import { StateStore } from './state-store.js';
+-import { ModelClient } from './model-client.js';
++import { ModelClient, normalizeInteraction } from './model-client.js';
+ import { OmbreClient, parseSurfacedDomains } from './ombre-client.js';
+ import { BarkClient } from './bark-client.js';
+ import { readOmbreHeartbeat } from './heartbeat-store.js';
+@@ -991,6 +991,11 @@
+ const recentClassified = [];   // 最近判过的类型（只在内存里，给「刚亲近完」「被晾着要有前文」这几道门用）
+ const MARK_TYPES = new Set(['affection', 'intimacy', 'empathy', 'loss', 'conflict', 'slighted']);
+ 
++function interactionClassificationDue(snapshot) {
++  const lastAt = Date.parse(snapshot.interactionClassifyAt ?? '');
++  return !Number.isFinite(lastAt) || Date.now() - lastAt >= (config.interaction?.classifyMinMinutes ?? 8) * 60_000;
++}
++
+ async function classifyExchange(event, source = 'api') {
+   if (event.interactionType === undefined && event.interaction_type !== undefined) event.interactionType = event.interaction_type;
+   // cause：她那句让他不痛快的话（≤60 字），只在冲突时有意义；接收端可以直接给，也可以由 exchange 里截出来
+@@ -999,12 +1004,17 @@
+   delete event.exchange;
+   // 09-28 和好两道关：留下她那句（≤80 字）给引擎核对有没有明确松口；只在内存里过这一跳，不落盘
+   if (exchange && !event.herWords && !event.her_words) event.herWords = (exchange.match(/她说：(.+?)(?:\s*他回：|$)/)?.[1] ?? exchange).trim().slice(0, 80);
+-  if (event.interactionType || !exchange || !config.model.enabled) return null;
++  const supplied = event.gateway_classification;
++  delete event.gateway_classification;
++  if (event.interactionType || !exchange || (!supplied && !config.model.enabled)) return null;
+   const snapshot = await store.read();
+-  const lastAt = Date.parse(snapshot.interactionClassifyAt ?? '');
+-  if (Number.isFinite(lastAt) && Date.now() - lastAt < (config.interaction?.classifyMinMinutes ?? 8) * 60_000) return { skipped: 'throttled' };
++  if (supplied && (event.event_id || event.eventId)) {
++    const fingerprint = auditEventFingerprint(event.eventId ?? event.event_id);
++    if (snapshot.recentConversationEvents?.some(item => item?.eventFingerprint === fingerprint)) return { skipped: 'duplicate' };
++  }
++  if (!interactionClassificationDue(snapshot)) return { skipped: 'throttled' };
+   try {
+-    const raw = await model.classifyInteraction(exchange);
++    const raw = supplied ? normalizeInteraction(supplied) : await model.classifyInteraction(exchange);
+     if (!raw) return null;
+     const { her } = splitExchange(exchange);
+     const nowMs = Date.now();
+@@ -1573,6 +1583,9 @@
+       return payload ? send(response, 200, payload) : send(response, 404, { error: 'not found' });
+     }
+ 
++    if (request.method === 'GET' && url.pathname === '/v1/interaction-classification/due') {
++      return send(response, 200, { due: interactionClassificationDue(await store.read()) });
++    }
+     if (request.method === 'GET' && url.pathname === '/v1/state') {
+       return send(response, 200, await store.read());
+     }
+@@ -1726,7 +1739,7 @@
+   }
+ });
+ 
+-server.listen(config.port, '0.0.0.0', async () => {
++server.listen(config.port, '127.0.0.1', async () => {
+   await store.read();
+   await cabin.init();
+   await blackBox.init();
+--- a/ombre-brain/src/bucket_manager.py
++++ b/ombre-brain/src/bucket_manager.py
+@@ -835,6 +835,11 @@
+     # Write content and metadata into a .md file
+     # 将内容和元数据写入一个 .md 文件
+     # ---------------------------------------------------------
++    @staticmethod
++    def dated_name(created: str, clean_title: str) -> str:
++        stamp = datetime.fromisoformat(created).strftime("%Y-%m-%d %H-%M-%S")
++        return f"{stamp} {clean_title}" if clean_title else stamp
++
+     async def create(
+         self,
+         content: str,
+@@ -856,6 +861,8 @@
+         allow_embedding_fallback: bool = False,
+         meaning: str = "",
+         media: Optional[list[dict]] = None,
++        *,
++        source_created_at: Optional[str] = None,
+     ) -> str:
+         """
+         Create a new memory bucket, return bucket ID.
+@@ -905,9 +912,13 @@
+             bucket_id = generate_bucket_id()
+         # 桶名 = "YYYY-MM-DD HH-MM-SS [LLM生成的标题]"，无标题时仅用时间戳。
+         # 使用连字符替代冒号，避免 sanitize_name 后续编辑时把冒号去掉破坏可读性。
+-        _ts = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+-        _clean = sanitize_name(name) if name else ""
+-        bucket_name = (f"{_ts} {_clean}" if (_clean and _clean != "unnamed") else _ts)[:80]
++        imported_at = now_iso()
++        created = source_created_at or imported_at
++        clean_title = sanitize_name(name) if name else ""
++        if clean_title == "unnamed" and source_tool != "aru-backup":
++            clean_title = ""
++        display_name = self.dated_name(created, clean_title)
++        bucket_name = display_name[:80]
+         # feel buckets are allowed to have empty domain; others default to ["未分类"]
+         if bucket_type == "feel":
+             domain = domain if domain is not None else []
+@@ -936,17 +947,19 @@
+         # 越界不静默 clamp：会产生 OB-W001/OB-W002 提示走到 MCP 返回末尾
+         metadata = {
+             "id": bucket_id,
+-            "name": bucket_name,
++            "name": display_name if source_tool == "aru-backup" else bucket_name,
+             "tags": tags,
+             "domain": domain,
+             "valence": _clamp_unit(valence, "valence", f"create:{bucket_id}"),
+             "arousal": _clamp_unit(arousal, "arousal", f"create:{bucket_id}"),
+             "importance": _clamp_importance(importance, f"create:{bucket_id}"),
+             "type": bucket_type,
+-            "created": now_iso(),
+-            "last_active": now_iso(),
++            "created": created,
++            "last_active": imported_at,
+             "activation_count": 0,
+         }
++        if source_created_at:
++            metadata["imported_at"] = imported_at
+         if pinned:
+             metadata["pinned"] = True
+         if protected:
+@@ -1255,6 +1268,15 @@
+             post["arousal"] = _clamp_unit(kwargs["arousal"], "arousal", f"update:{bucket_id}")
+         if "name" in kwargs:
+             post["name"] = sanitize_name(kwargs["name"])
++        if "source_created_at" in kwargs:
++            if kwargs["source_created_at"]:
++                post.metadata.setdefault("imported_at", post["created"])
++                post["created"] = kwargs["source_created_at"]
++            elif "imported_at" in post.metadata:
++                post["created"] = post["imported_at"]
++        if "source_name" in kwargs and post.get("source_tool") == "aru-backup":
++            clean_title = sanitize_name(self._sanitize_text(kwargs["source_name"]))
++            post["name"] = self.dated_name(post["created"], clean_title)
+         if "resolved" in kwargs:
+             post["resolved"] = kwargs["resolved"]
+         if "pinned" in kwargs:
+@@ -1264,6 +1286,10 @@
+                 post.metadata.pop("anchor", None)  # pinned 与 anchor 互斥：钉为核心准则即清除坐标系标记
+         if "digested" in kwargs:
+             post["digested"] = kwargs["digested"]
++        if kwargs.get("gateway_receipt"):
++            receipts = post.get("gateway_receipts") or []
++            if kwargs["gateway_receipt"] not in receipts:
++                post["gateway_receipts"] = [*receipts, kwargs["gateway_receipt"]]
+         if "model_valence" in kwargs:
+             post["model_valence"] = _clamp01(kwargs["model_valence"], _DEFAULT_VALENCE)
+         if "media" in kwargs:
+--- a/ombre-brain/src/tools/_common.py
++++ b/ombre-brain/src/tools/_common.py
+@@ -607,7 +607,8 @@
+     if existing and existing[0].get("score", 0) > (rt.config.get("merge_threshold") or 75):
+         bucket = existing[0]
+         # --- 不合并到钉选/保护桶 ---
+-        if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
++        if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")
++                or str(bucket["metadata"].get("grow_batch_id") or "").startswith("aru:")):
+             try:
+                 if raw_merge or exact_storage_match:
+                     # --- 原文拼接合并（hold 路径）---
+@@ -641,6 +642,8 @@
+                     update_kwargs["meaning_append"] = meaning
+                 if media:
+                     update_kwargs["media_append"] = media
++                if source_tool == "gateway-import" and grow_batch_id:
++                    update_kwargs["gateway_receipt"] = grow_batch_id
+                 await rt.bucket_mgr.update(
+                     bucket["id"],
+                     allow_embedding_fallback=(raw_merge and source_tool == "hold"),
+--- a/ombre-brain/src/web/import_api.py
++++ b/ombre-brain/src/web/import_api.py
+@@ -123,6 +123,9 @@
+ 
+ 
+ def register(mcp) -> None:
++    from nian_memory import register_gateway_import
++    register_gateway_import(mcp, sh)
++
+ 
+     @mcp.custom_route("/api/host-vault", methods=["GET"])
+     async def api_host_vault_get(request: Request) -> Response:
+--- a/ombre-brain/src/web/buckets.py
++++ b/ombre-brain/src/web/buckets.py
+@@ -25,9 +25,9 @@
+ logger = sh.logger
+ 
+ try:
+-    from utils import strip_wikilinks, parse_bool  # type: ignore
++    from utils import strip_wikilinks, extract_wikilinks, parse_bool  # type: ignore
+ except ImportError:  # pragma: no cover
+-    from ..utils import strip_wikilinks, parse_bool  # type: ignore
++    from ..utils import strip_wikilinks, extract_wikilinks, parse_bool  # type: ignore
+ 
+ try:
+     from tools._common import check_pinned_quota as _check_pinned_quota  # type: ignore
+@@ -219,6 +219,7 @@
+                     "activation_count": meta.get("activation_count", 0),
+                     "score": sh.decay_engine.calculate_score(meta),
+                     "content_preview": strip_wikilinks(b.get("content", ""))[:200],
++                    "wikilinks": extract_wikilinks(b.get("content", "")),
+                     # iter 1.8 新增字段（后台老桶读出默认值）
+                     "why_remembered": meta.get("why_remembered", ""),
+                     "dont_surface": bool(meta.get("dont_surface", False)),
+@@ -253,7 +254,10 @@
+         return JSONResponse({
+             "id": bucket["id"],
+             "metadata": meta,
+-            "content": strip_wikilinks(bucket.get("content", "")),
++            "wikilinks": extract_wikilinks(bucket.get("content", "")),
++            "content": (bucket.get("content", "")
++                        if request.query_params.get("wikilinks") == "1"
++                        else strip_wikilinks(bucket.get("content", ""))),
+             "score": sh.decay_engine.calculate_score(meta),
+             "triggered_feels": triggered_feels,  # iter 1.9 D
+         })
+--- a/ombre-brain/src/web/search.py
++++ b/ombre-brain/src/web/search.py
+@@ -72,6 +72,7 @@
+                     "valence": meta.get("valence", 0.5),
+                     "arousal": meta.get("arousal", 0.3),
+                     "content_preview": strip_wikilinks(b.get("content", ""))[:200],
++                    "wikilinks": extract_wikilinks(b.get("content", "")),
+                 })
+             return JSONResponse(result)
+         except Exception as e:
+--- a/ombre-brain/frontend/dashboard.html
++++ b/ombre-brain/frontend/dashboard.html
+@@ -1582,6 +1582,11 @@
+     gap: 8px;
+     flex-shrink: 0;
+   }
++  .ob-wiki-list { display:flex; align-items:baseline; flex-wrap:wrap; gap:3px 10px; margin:5px 0; }
++  .ob-wiki-label { font-size:12px; color:var(--text-dim); }
++  .ob-wiki-term { color:var(--accent); text-decoration:underline; text-underline-offset:2px; overflow-wrap:anywhere; }
++  .bucket-row .ob-wiki-term { font-size:13px; }
++  .ob-wiki-term:focus-visible { outline:2px solid currentColor; outline-offset:2px; }
+   .bucket-row-bottom {
+     padding-left: 36px;
+     min-width: 0;
+@@ -3224,6 +3229,7 @@
+   const resp = await fetch('/auth/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: pwd}) });
+   if (resp.ok) {
+     document.getElementById('auth-overlay').style.display = 'none';
++    await openMemoryDashboard();
+   } else {
+     const d = await resp.json().catch(() => ({}));
+     showAuthError(d.detail || '密码错误');
+@@ -4147,14 +4153,14 @@
+   const q = e.target.value.trim();
+   searchTimer = setTimeout(() => {
+     if (q) searchBuckets(q);
+-    else renderBuckets(allBuckets);
++    else renderBuckets(filterBuckets(allBuckets));
+   }, 300);
+ });
+ function doSearch() {
+   clearTimeout(searchTimer);
+   const q = document.getElementById('search-input').value.trim();
+   if (q) searchBuckets(q);
+-  else renderBuckets(allBuckets);
++  else renderBuckets(filterBuckets(allBuckets));
+ }
+ 
+ async function loadBuckets() {
+@@ -4167,7 +4173,7 @@
+     allBuckets = data;
+     updateStats();
+     buildFilters();
+-    renderBuckets(allBuckets);
++    doSearch();
+   } catch (e) {
+     document.getElementById('bucket-list').innerHTML = '<div class="loading">加载失败: ' + esc(e.message) + '</div>';
+   }
+@@ -4190,6 +4196,7 @@
+   const filters = document.getElementById('filters');
+   const types = [
+     { key: 'all', label: '全部' },
++    { key: 'wikilinks', label: '有双链（' + allBuckets.filter(b => b.wikilinks && b.wikilinks.length).length + '）' },
+     { key: 'pinned', label: '<i data-lucide="pin"></i> 钉选' },
+     { key: 'feel', label: '<i data-lucide="droplet"></i> Feel' },
+     { key: 'unresolved', label: '<i data-lucide="zap"></i> 未解决' },
+@@ -4197,23 +4204,24 @@
+     { key: 'archived', label: '<i data-lucide="archive"></i> 归档' },
+   ];
+   filters.innerHTML = types.map(function(t) {
+-    return '<button class="filter-btn ' + (t.key === 'all' ? 'active' : '') + '" data-filter="' + escAttr(t.key) + '">' + t.label + '</button>';
++    return '<button class="filter-btn ' + (t.key === currentFilter ? 'active' : '') + '" data-filter="' + escAttr(t.key) + '">' + t.label + '</button>';
+   }).join('') + Array.from(domains).slice(0, 10).map(function(d) {
+-    return '<button class="filter-btn" data-filter="' + escAttr('domain:' + d) + '">' + esc(d) + '</button>';
++    return '<button class="filter-btn ' + (currentFilter === 'domain:' + d ? 'active' : '') + '" data-filter="' + escAttr('domain:' + d) + '">' + esc(d) + '</button>';
+   }).join('');
+ 
+-  filters.addEventListener('click', function(e) {
++  filters.onclick = function(e) {
+     var btn = e.target.closest('.filter-btn');
+     if (!btn) return;
+     filters.querySelectorAll('.filter-btn').forEach(function(b) { b.classList.remove('active'); });
+     btn.classList.add('active');
+     currentFilter = btn.dataset.filter;
+-    renderBuckets(filterBuckets(allBuckets));
+-  });
++    doSearch();
++  };
+ }
+ 
+ function filterBuckets(buckets) {
+   if (currentFilter === 'all') return buckets;
++  if (currentFilter === 'wikilinks') return buckets.filter(b => b.wikilinks && b.wikilinks.length);
+   if (currentFilter === 'pinned') return buckets.filter(function(b) { return b.pinned; });
+   if (currentFilter === 'feel') return buckets.filter(function(b) { return b.type === 'feel'; });
+   if (currentFilter === 'unresolved') return buckets.filter(function(b) { return !b.resolved && b.type !== 'permanent' && !b.pinned; });
+@@ -4305,7 +4313,7 @@
+         '</div>' +
+         '<span class="time">' + esc(timeAgo) + '</span>' +
+       '</div>' +
+-      '<div class="bucket-row-bottom"><span class="preview">' + esc(b.content_preview) + '</span></div>' +
++      '<div class="bucket-row-bottom"><span class="preview">' + esc(b.content_preview) + '</span></div>' + wikiList(b.wikilinks) +
+     '</div>';
+   }).join('') + _bucketPagerHtml(visible.length, totalPages);
+   if (window.lucide) lucide.createIcons();
+@@ -4335,6 +4343,12 @@
+ }
+ 
+ async function searchBuckets(query) {
++  const exact = /^\[\[([^\[\]\n]+)\]\]$/.exec(query);
++  if (exact) {
++    const term = exact[1].toLowerCase();
++    renderBuckets(filterBuckets(allBuckets).filter(b => (b.wikilinks || []).some(w => w.toLowerCase() === term)));
++    return;
++  }
+   var seen = {}, merged = [];
+   _localBucketMatches(query).forEach(function(b) { if (!seen[b.id]) { seen[b.id] = 1; merged.push(b); } });
+   // 服务端语义搜索：补充本地字面没匹配到、但语义相关的桶（向量化未开启时会失败，自动退化为纯本地）
+@@ -4345,7 +4359,34 @@
+       if (Array.isArray(results)) results.forEach(function(b) { if (!seen[b.id]) { seen[b.id] = 1; merged.push(b); } });
+     }
+   } catch (e) { /* 离线 / 无向量化：退化为纯本地字面 + 模糊匹配 */ }
+-  renderBuckets(merged);
++  if (document.getElementById('search-input').value.trim() === query) renderBuckets(filterBuckets(merged));
++}
++
++function wikiTerm(term, text) {
++  return '<a class="ob-wiki-term" href="?wikilink=' + escAttr(encodeURIComponent(term)) +
++    '" onclick="event.stopPropagation()" title="' + escAttr('查看引用「' + term + '」的记忆') + '">' +
++    esc(text || '[[' + term + ']]') + '</a>';
++}
++
++function wikiList(terms) {
++  if (!terms || !terms.length) return '';
++  return '<div class="ob-wiki-list"><span class="ob-wiki-label">双链</span>' +
++    terms.map(term => wikiTerm(term)).join(' ') + '</div>';
++}
++
++function wikiBody(body, terms) {
++  if (!terms || !terms.length) return esc(body);
++  const known = new Set(terms), parts = [];
++  const pattern = /\[\[([^\]\|#]+)(?:[#|][^\]]*)?\]\]/g;
++  let start = 0;
++  for (const match of body.matchAll(pattern)) {
++    const term = match[1].trim();
++    if (!known.has(term)) continue;
++    parts.push(esc(body.slice(start, match.index)), wikiTerm(term, match[0]));
++    start = match.index + match[0].length;
++  }
++  parts.push(esc(body.slice(start)));
++  return parts.join('');
+ }
+ 
+ async function showDetail(id) {
+@@ -4355,7 +4396,7 @@
+   panel.classList.add('open');
+ 
+   try {
+-    var res = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id));
++    var res = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id) + '?wikilinks=1');
+     var b = await res.json();
+     var meta = b.metadata || {};
+     // letter → 翻信纸展开动画；anchor → 引力线背景（坐标系质感）
+@@ -4380,7 +4421,7 @@
+     }
+     content.innerHTML =
+       '<h2>' + esc(meta.name || id) + firstBadge + '</h2>' +
+-      whyHtml +
++      wikiList(b.wikilinks) + whyHtml +
+       '<div class="detail-meta">' +
+         '<div class="field"><label>ID</label>' + esc(id) + '</div>' +
+         '<div class="field"><label>类型 / Type</label>' + esc(meta.type || 'dynamic') + '</div>' +
+@@ -4410,7 +4451,7 @@
+         '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketArchive(this.dataset.bucketId)" class="icon-btn"><i data-lucide="archive"></i> 归档</button>' +
+         '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketDelete(this.dataset.bucketId)" class="icon-btn" style="color:#b85c3c;"><i data-lucide="trash-2"></i> 删除到档案</button>' +
+       '</div>' +
+-      '<div class="detail-content">' + esc(b.content) + '</div>' +
++      '<div class="detail-content">' + wikiBody(b.content, b.wikilinks) + '</div>' +
+       renderEditForm(id, Object.assign({}, meta, {_content_for_edit: b.content}));
+   } catch (e) {
+     content.innerHTML = '<div class="loading">加载失败: ' + esc(e.message) + '</div>';
+@@ -6628,7 +6669,19 @@
+   }
+ }
+ 
+-checkAuth().then(authed => { if (authed) { loadBuckets(); loadStatusBanner(); } });
++async function openMemoryDashboard() {
++  await loadBuckets();
++  loadStatusBanner();
++  const params = new URLSearchParams(location.search);
++  const term = params.get('wikilink');
++  if (term) {
++    document.getElementById('search-input').value = '[[' + term + ']]';
++    doSearch();
++  }
++  const id = params.get('bucket');
++  if (id && allBuckets.some(b => b.id === id)) await showDetail(id);
++}
++checkAuth().then(authed => { if (authed) openMemoryDashboard(); });
+ 
+ // ====== iter 1.7: version badge, plan kanban, about page ======
+ var _obLocalVersion = null;
+--- a/xinchao/src/mcp-protocol.js
++++ b/xinchao/src/mcp-protocol.js
+@@ -23,17 +23,15 @@
+ ]);
+ 
+ // 心潮念网关：对外暴露的 OB 记忆工具（精简集，purge/restore/letter/plan 不暴露）。
+-// hold 保留（2026-08-09 复议：hold 有了 meaning 字段能补上下文，与 grow 不冲突——
+-// 日常/日记整理走 grow，重要瞬间可用 hold 但必须写 meaning）。
++// Aru 备份负责批量导入，协作者仍可用 hold 手动记下重要瞬间。
+ // 走代理转发到 OB；schema 在 tools/list 时动态从 OB 拉，永不漂移。
+-export const OB_PROXY_TOOLS = ['breath', 'hold', 'grow', 'trace', 'forget', 'dream', 'anchor', 'release', 'I', 'pulse'];
++export const OB_PROXY_TOOLS = ['breath', 'hold', 'trace', 'forget', 'dream', 'anchor', 'release', 'I', 'pulse'];
+ const OB_PROXY_SET = new Set(OB_PROXY_TOOLS);
+ 
+ // 对外用中文标题 + 中文说明（内部名保持不变，用于协议路由）。让机看到的是"浮现记忆"而不是"breath"。
+ const OB_TOOL_LABELS = {
+   breath:  { title: '浮现记忆', description: '让当前最相关的长期记忆自然浮现，并带回近期梦境摘要与余韵。用于新窗口开始、上下文断层、或确需重新寻找相关记忆时；不要每条消息调用。' },
+   hold:    { title: '沉淀一条', description: '当场存一条重要的短记忆（重要决定、关系变化、有长期意义的话或共同经历）。必须写 meaning 补上下文；不适合普通寒暄、临时信息或每一句对话。' },
+-  grow:    { title: '整理导入', description: '把一段整理好的内容（如当天日记）按有意义的小节导入，系统自动拆成多条并各自尝试合并。日常/日记整理走这条。' },
+   trace:   { title: '追溯修改', description: '修改一条已存在记忆的字段（重要度、标签、domain、标记已放下/已消化、软删除等）。不要猜 id、不要自行改写正文。' },
+   forget:  { title: '淡忘归档', description: '软删除一条记忆：移入归档、不再参与浮现，正文保留、可恢复。' },
+   dream:   { title: '消化梦境', description: '长期记忆的离线消化，产出梦境余韵。不是睡眠梦境、也不触发推送。' },
+@@ -93,13 +91,8 @@
+   },
+   {
+     name: 'xinchao_event',
+-    title: '回传心潮窗口事件',
+-    description: [
+-      '回传一次明确的人机互动，并更新当前窗口短状态。',
+-      '它会先结算事件发生前的时间增长，再唤醒心潮；可用受限互动类型触发服务端固定的欲望反馈。',
+-      '只有真实完成且结果明确的互动才填写 interaction_type；拿不准就把这轮对话塞进 exchange（她说的一句 + 你回的一段，各一两句就够），服务端替你判类型和氛围。',
+-      '客户端不能直接填写欲望数值，也不会修改 OB 长期记忆。'
+-    ].join(''),
++    title: '记录自己完成的行动',
++    description: '在独处时完成了一次分享、反思、任务推进或探索，可用这个工具记下结果。',
+     inputSchema: {
+       type: 'object',
+       properties: {
+@@ -113,33 +106,12 @@
+           type: 'string',
+           minLength: 1,
+           maxLength: 120,
+-          description: '本次真实互动的唯一不透明标识；重试必须复用同一个值以避免重复结算。',
++          description: '这次行动的唯一标识。重试时复用同一个值。',
+         },
+         interaction_type: {
+           type: 'string',
+-          enum: [
+-            'companionship',
+-            'affection',
+-            'intimacy',
+-            'sharing',
+-            'discovery',
+-            'task_progress',
+-            'reflection',
+-            'conflict',
+-            'loss',
+-            'reconciliation',
+-            'slighted',
+-            'empathy',
+-            'helped',
+-            'intrigued',
+-          ],
+-          description: [
+-            '已完成互动的结果类型；仅由心潮服务端映射为受限欲望变化。',
+-            '在自己的窗口里直接填类型时只认四种自我动作：sharing / reflection / task_progress / discovery；她参与的互动（陪伴/安抚/亲密/冲突/和好…）请给 exchange，由服务端从她的话里判——自己填会被当普通对话事件，不动驱力。',
+-            'companionship=陪伴交流，affection=明确关心安抚，intimacy=明确亲密互动，',
+-            'sharing=完成分享，discovery=共同探索，task_progress=推进任务，',
+-            'reflection=完成沉淀，conflict=发生冲突，loss=经历失落，reconciliation=完成和解，slighted=没被偏爱（吃醋/被晾着/被忘），empathy=为别人的处境起了心（配 sub 心疼/不平/想帮忙/替人高兴 和 closeness），helped=为别人做了点什么（写信/回帖/出主意），intrigued=她说了半句、想知道后面（想了解她）。',
+-          ].join(''),
++          enum: ['sharing', 'reflection', 'task_progress', 'discovery'],
++          description: 'sharing 表示完成分享，reflection 表示完成反思，task_progress 表示推进任务，discovery 表示有所发现。',
+         },
+         tone: {
+           type: 'string',
+@@ -155,34 +127,8 @@
+           maximum: 1440,
+           default: 240,
+         },
+-        sub: {
+-          type: 'string',
+-          enum: ['生气', '不满', '不甘心', '失落', '委屈', '分别', '吃醋', '被晾着', '被忘', '心疼', '不平', '想帮忙', '替人高兴', '自责', '想了解她', '害羞'],
+-          description: '可选，配合 conflict / loss / slighted / empathy：是哪一种（生气/不满/不甘心；失落/委屈/分别/自责；吃醋/被晾着/被忘；心疼/不平/想帮忙/替人高兴）。不确定就别传，只记大类。',
+-        },
+-        closeness: {
+-          type: 'string',
+-          enum: ['her', 'family', 'known', 'stranger'],
+-          description: '只配合 empathy：那个人离你多近（her=她本人，family=家人和挚友，known=认识的人/笔友/论坛同类，stranger=陌生人/新闻）。',
+-        },
+-        who: {
+-          type: 'string',
+-          maxLength: 40,
+-          description: '只配合 empathy：是谁、什么事（≤20 字），用来给同一件事去重。',
+-        },
+-        cause: {
+-          type: 'string',
+-          maxLength: 120,
+-          description: '可选，只配合 interaction_type=conflict：她那句让你不痛快的话（≤60 字）。心潮会记着在气什么，和好或气消了自动忘。',
+-        },
+-        exchange: {
+-          type: 'string',
+-          minLength: 4,
+-          maxLength: 1500,
+-          description: '可选：这轮对话的一小段（她说的 + 你回的），没填 interaction_type 时服务端据此判类型和氛围。只走这一跳，不落盘。',
+-        },
+-      },
+-      required: ['event_id'],
++      },
++      required: ['event_id', 'interaction_type'],
+       additionalProperties: false,
+     },
+     annotations: {
+@@ -632,7 +578,7 @@
+       : '';
+     const duplicate = result.duplicate ? ' duplicate=true' : '';
+     const gated = result.interaction?.reasonCode === 'needs_her'
+-      ? `\n${result.interaction.type} 这种要有她的话为证：把这轮对话塞进 exchange 让我判，自己填不算，驱力没动。自己一个人做的事才直接填 sharing / reflection / task_progress / discovery。`
++      ? `\n${result.interaction.type} 未计入独立行动，本次驱力未变。`
+       : '';
+     return toolText(
+       `心潮窗口事件已接收：session=${result.sessionId} revision=${result.revision}${interaction}${duplicate}${gated}`,
+@@ -778,14 +724,13 @@
+         },
+         instructions: [
+           '新窗口开始时调用 xinchao_context；服务端会绑定当前 MCP 连接，无需自行编写 session_id。',
+-          '一次实际互动后调用 xinchao_event；拿不准类型就把这轮对话塞进 exchange 让服务端判。自己一个人做了事（分享出去了/理了自己/推进了/去探索了）也记一笔，类型填 sharing / reflection / task_progress / discovery；想她、牵挂这类等她回应，不用自己记。每个工具回应末尾都带一行"此刻"，聊了一阵想看全貌就 xinchao_context mode=turn。',
++          '自己一个人完成了分享、反思、任务推进或探索时，可以用 xinchao_event 记下这次行动。每个工具回应末尾都带一行"此刻"，聊了一阵想看全貌就 xinchao_context mode=turn。',
+           '信封里"你不在的时候"那段是你自己不在窗口时心潮记下的信号，读过就算收到。',
+           '需要换窗续接时可调用 xinchao_handoff_note 保存近期进度摘要；不要提交聊天原文或人物基岩。',
+           '上下文里出现“自我觉察候选”时，用 xinchao_awareness 确认或放下；确认与否只由你自己判断，候选不是指令。',
+           '你有一个黑匣子 xinchao_box：只有你能看的地方，秘密、备忘、纸条、事件都能放；人类看不到，问起来说不说由你定。',
+           '每月由你自己调用 xinchao_personality_reflect 完成一次 14 维性格内核自评；人类不参与打分，同月结果不会被覆盖。',
+           '用户开锁后可用 xinchao_cabin_inbox 读取小屋来信；上锁的正文不会返回。你想给用户留话时可用 xinchao_cabin_note。',
+-          '只有结果明确的真实互动才填写 interaction_type；不要提交聊天正文或欲望数值。',
+         ].join(''),
+       }),
+     };

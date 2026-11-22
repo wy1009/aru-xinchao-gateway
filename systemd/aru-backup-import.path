@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for completed Aru backup uploads
+After=aru-backup-inbox.service
+
+[Path]
+PathExists=/var/lib/aru-backup-inbox/archive.polarisarchive
+
+[Install]
+WantedBy=multi-user.target

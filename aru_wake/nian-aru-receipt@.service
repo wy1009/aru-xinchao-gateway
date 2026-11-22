@@ -1,0 +1,16 @@
+[Unit]
+Description=Check one Aru phone receipt
+[Service]
+User=aru-selfhost
+Group=aru-selfhost
+ExecStart=/usr/bin/python3 -I -B /opt/xinchao-nian/aru-wake/receipt.py
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+RuntimeMaxSec=8s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX

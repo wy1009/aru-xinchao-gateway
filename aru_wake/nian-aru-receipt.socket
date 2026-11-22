@@ -1,0 +1,9 @@
+[Unit]
+Description=Local Aru phone receipts for Xinchao
+[Socket]
+ListenStream=/run/nian-aru-receipt.sock
+SocketMode=0660
+SocketGroup=nian-aru-bridge
+Accept=yes
+[Install]
+WantedBy=sockets.target
