@@ -314,6 +314,60 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                              [f"她说：问题{i}\n他回：答复{i}" for i in range(7)])
             self.assertEqual([e["event_id"] for e in posted], ["0", "2", "3", "4", "6"])
 
+    async def test_cabin_reply_only_after_final_text_and_idempotent_on_retry(self):
+        question = aru_wake_message("【小屋桥·互动｜心潮 MCP】收到一个拥抱。")
+        for other in ("【小屋桥·留话｜心潮 MCP】", "【小屋桥·预约｜心潮 MCP】",
+                      "【小屋桥·反馈｜心潮 MCP】", "【此刻，协作者的状态】", "[Leto]"):
+            self.assertFalse(gateway.is_cabin_interaction(aru_wake_message(other + question)))
+        self.assertFalse(gateway.is_cabin_interaction("【小屋桥·互动｜心潮 MCP】普通文字"))
+        self.assertTrue(gateway.is_cabin_interaction(aru_wake_message("【小屋桥·互动】旧通知")))
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "turns.sqlite"
+            db = self.queue(path)
+            messages = [{"role": "user", "content": question}]
+            def identity(key):
+                req = SimpleNamespace(headers={"idempotency-key": key, "x-conversation-id": "room"})
+                return gateway.turn_identity(req, {}, messages)
+            turn = identity("request-1")
+            tools = [{"id": "call", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]
+            for delta, reason in (({"content": "半句话"}, None), ({"content": "未完"}, "length"),
+                                  ({"content": "稍等", "tool_calls": tools}, "stop"),
+                                  ({"tool_calls": tools}, "tool_calls"), ({"content": " "}, "stop")):
+                partial = gateway.Completion(db, turn)
+                partial.accept({"choices": [{"delta": delta, "finish_reason": reason}]}, True)
+                partial.save()
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM turns").fetchone()[0], 0)
+            messages.extend([{"role": "assistant", "tool_calls": tools},
+                             {"role": "tool", "tool_call_id": "call", "content": "结果"}])
+            self.assertEqual(identity("request-2")[0], turn[0])
+            final = gateway.Completion(db, identity("request-2"))
+            final.accept({"choices": [{"delta": {"content": "我收到啦。"}, "finish_reason": "stop"}]}, True)
+            final.save()
+            row = db.execute("SELECT * FROM turns").fetchone()
+            self.assertEqual((row["mode"], row["question"], row["answer"], row["memory_check"]),
+                             ("cabin_reply", "", "", 0))
+            posted = []
+            def route(request):
+                self.assertEqual(request.url.path, "/v1/conversation-event")
+                posted.append(json.loads(request.content))
+                if len(posted) == 1:
+                    raise httpx.ReadTimeout("acknowledgment lost")
+                return httpx.Response(200, json={"duplicate": True})
+            with patch.dict(os.environ, NIAN_MIND_TOKEN="test"):
+                async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+                    app = SimpleNamespace(state=SimpleNamespace(db=db, client=client))
+                    await gateway.run_job(app, "turns", row, gateway.process_turn)
+                    db.close()
+                    db = app.state.db = self.queue(path)
+                    row = db.execute("SELECT * FROM turns").fetchone()
+                    self.assertEqual((row["state"], row["failures"]), ("pending", 1))
+                    await gateway.process_turn(app, row)
+            gateway.enqueue(db, turn[0], "room", question, "重试")
+            self.assertEqual([r[0] for r in db.execute("SELECT state FROM turns")], ["done"])
+            self.assertEqual(posted, [{"session_id": "room", "event_id": "cabin-reply-" + turn[0]}] * 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM emotion_reports").fetchone()[0], 0)
+
     async def test_turn_and_idempotent_ob_delivery(self):
         with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
             root = Path(tmp)
@@ -642,6 +696,17 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(
                             matches[0].read_text().count(memory["content"]), 1
                         )
+
+                        # A cabin reply reaches the real isolated Mind without a second interaction effect.
+                        cabin_db = self.queue()
+                        cabin_app = SimpleNamespace(state=SimpleNamespace(db=cabin_db, client=private))
+                        incoming = aru_wake_message("【小屋桥·互动｜心潮 MCP】收到一个拥抱。")
+                        gateway.enqueue(cabin_db, "hug-reply", "cabin-room", incoming, "我收到啦。")
+                        await gateway.process_turn(cabin_app, cabin_db.execute("SELECT * FROM turns").fetchone())
+                        final_events = json.loads(state_path.read_text())["recentConversationEvents"]
+                        self.assertEqual(len(final_events), len(events) + 1)
+                        self.assertIsNone(final_events[-1]["interactionType"])
+                        self.assertEqual(cabin_db.execute("SELECT state FROM turns").fetchone()[0], "done")
 
     def queue(self, path=":memory:"):
         db = sqlite3.connect(path)

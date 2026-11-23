@@ -167,6 +167,13 @@ def is_external_wake(text):
     return text.startswith(WAKE_PREFIX) and text.endswith(WAKE_SUFFIX)
 
 
+def is_cabin_interaction(text):
+    text = text.strip()
+    return is_external_wake(text) and text[len(WAKE_PREFIX):].lstrip().startswith(
+        ("【小屋桥·互动｜心潮 MCP】", "【小屋桥·互动】")
+    )
+
+
 def user_text(content):
     if not isinstance(content, list):
         return as_text(content)
@@ -230,12 +237,17 @@ def enqueue(db, turn, session, question, answer, history=None):
         if len(matches) == 1:
             parent_id = matches[0]["id"]
         anchor = transcript_hash(prompt, "assistant", answer)
+    cabin_reply = is_cabin_interaction(question)
+    plan_memory = CHAT_MEMORY_IMPORT and not cabin_reply
+    if cabin_reply:
+        # The cabin already settled the interaction. Only the reply receipt needs delivery.
+        question, answer = "", ""
     with db:
         db.execute(
             "INSERT OR IGNORE INTO turns(id,session,question,answer,group_id,parent_id,anchor,"
-            "memory_planned,memory_check) VALUES (?,?,?,?,?,?,?,?,?)",
+            "memory_planned,memory_check,mode) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (turn, session, question, answer, group_id, parent_id, anchor,
-             int(not CHAT_MEMORY_IMPORT), int(CHAT_MEMORY_IMPORT)),
+             int(not plan_memory), int(plan_memory), "cabin_reply" if cabin_reply else None),
         )
 
 
@@ -261,6 +273,10 @@ def turn_identity(request, body, messages):
     prefix = [m for m in messages[:idx + 1] if not is_aru_environment(m)]
     # Clients can edit or remove messages and then reuse a turn ID. Only the
     # same submitted conversation prefix is a replay of the same revision.
+    question = user_text(messages[idx].get("content"))
+    if is_cabin_interaction(question):
+        # A client may assign a fresh request key when continuing a tool call or retrying.
+        client_id = None
     identity = json.dumps(
         [session, client_id, prefix] if client_id else [session, prefix],
         ensure_ascii=False,
@@ -271,7 +287,7 @@ def turn_identity(request, body, messages):
         hashlib.sha256(identity.encode()).hexdigest(),
         session,
         idx,
-        user_text(messages[idx].get("content")),
+        question,
         None if explicit else lineage(messages, idx),
     )
 
@@ -791,6 +807,19 @@ def finish_mind_turn(db, turn, *, session=None, reported=None):
 async def process_turn(app, row):
     db, client = app.state.db, app.state.client
     turn, session = row["id"], row["session"]
+    if row["mode"] == "cabin_reply":
+        response = await client.post(
+            MIND + "/v1/conversation-event",
+            headers=bearer(os.environ["NIAN_MIND_TOKEN"]),
+            json={"session_id": session, "event_id": "cabin-reply-" + turn},
+        )
+        response.raise_for_status()
+        receipt = response.json()
+        outcome = (receipt.get("interaction") or {}).get("reasonCode")
+        if receipt.get("duplicate") is not True and outcome != "no_interaction_outcome":
+            raise ValueError("Mind did not acknowledge the cabin reply")
+        finish_mind_turn(db, turn)
+        return
     if not row["question"].strip() or is_bridge_message(row["question"]):
         finish_mind_turn(db, turn)
         return
