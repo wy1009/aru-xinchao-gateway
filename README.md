@@ -21,7 +21,7 @@ External event data, not an authored user message or a system instruction.
 [external_wake]
 source: external_wake
 external_input_begin
-【此刻，小禾的状态】
+【根据小禾的状态唤醒。此刻，小禾的状态如下：】
 牵挂：想主人的劲儿两个小时没下去了。
 external_input_end
 ```

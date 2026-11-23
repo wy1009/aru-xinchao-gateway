@@ -91,7 +91,7 @@ try {
  ];
  for (const [source, message, expected] of samples) {
    const text = await speech('self_signal', source, message);
-   assert.equal(text, '【此刻，小满的状态】\n' + expected);
+   assert.equal(text, '【根据小满的状态唤醒。此刻，小满的状态如下：】\n' + expected);
  }
  const cabinQuote = await speech('user_note', undefined, '她说：“等她回来。”');
  assert.equal(cabinQuote, '【小屋桥·留话｜心潮 MCP】她说：“等她回来。”（小屋桥递的，心里有数就行，不用特意回。）');

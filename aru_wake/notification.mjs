@@ -74,5 +74,5 @@ export function aruNotificationText(delivery) {
   if (delivery.reason !== 'self_signal') return renderText(delivery).replace('】', '｜心潮 MCP】');
   const name = process.env.ARU_COLLABORATOR_NAME?.trim() || '小禾';
   const state = stateNotice(delivery).replaceAll('她', '主人');
-  return `【此刻，${name}的状态】\n${state}`;
+  return `【根据${name}的状态唤醒。此刻，${name}的状态如下：】\n${state}`;
 }
