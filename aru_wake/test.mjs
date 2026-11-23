@@ -33,13 +33,15 @@ try {
  for (const [reason, label, body] of [
    ['user_note', '留话', '主人在小屋里留了一封上锁的信。你可以知道它存在，但在对方主动开锁前不能读取正文。'],
    ['user_note', '留话', '主人刚刚打开了小屋里那封信的锁，现在允许你通过“小屋收件箱”读取正文。'],
-   ['user_interaction', '互动', '主人刚刚给了你一个拥抱，落在牵挂上。回应之后记得回传一次，否则心潮不知道你们已经聊过。'],
  ]) {
    const event = {...note, reason, message:body, deliveryId:'delivery-' + randomUUID()};
    const result = await deliver(event, bundle, opts);
    assert.equal(unseal(result).content, '【小屋桥·' + label + '｜心潮 MCP】' + body + '（小屋桥递的，心里有数就行，不用特意回。）');
  }
- for (const [reason, label] of [['user_interaction', '互动'], ['scheduled_interaction', '预约'], ['user_feedback', '反馈']]) {
+ const hug = {...note, reason:'user_interaction', deliveryId:'delivery-' + randomUUID(),
+   message:'主人刚刚给了你一个拥抱，落在牵挂上。回应之后记得回传一次，否则心潮不知道你们已经聊过。'};
+ assert.equal(unseal(await deliver(hug,bundle,opts)).content, '【小屋桥·互动｜心潮 MCP】主人刚刚给了你一个拥抱，落在牵挂上。');
+ for (const [reason, label] of [['scheduled_interaction', '预约'], ['user_feedback', '反馈']]) {
    const event = {...note, reason, deliveryId: 'delivery-' + randomUUID(), message: '同一段正文【示例】'};
    const result = await deliver(event, bundle, opts);
    assert.equal(unseal(result).content, '【小屋桥·' + label + '｜心潮 MCP】同一段正文【示例】（小屋桥递的，心里有数就行，不用特意回。）');

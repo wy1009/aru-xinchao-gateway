@@ -68,6 +68,11 @@ function stateNotice({message, sourceEventId = ''}) {
 }
 
 export function aruNotificationText(delivery) {
+  if (delivery.reason === 'user_interaction') {
+    const message = delivery.message.trim().replace(/\s+/gu, ' ')
+      .replace(/回应之后记得回传一次，否则心潮不知道你们已经聊过。$/u, '');
+    return '【小屋桥·互动｜心潮 MCP】' + message;
+  }
   if (delivery.reason !== 'self_signal') return renderText(delivery).replace('】', '｜心潮 MCP】');
   const name = process.env.ARU_COLLABORATOR_NAME?.trim() || '小禾';
   const state = stateNotice(delivery).replaceAll('她', '主人');
