@@ -22,7 +22,14 @@ try {
    const sealed = Buffer.from(envelope.sealedPayload, 'base64');
    const decipher = createDecipheriv('aes-256-gcm', key, sealed.subarray(0, 12));
    decipher.setAuthTag(sealed.subarray(-16));
-   return JSON.parse(Buffer.concat([decipher.update(sealed.subarray(12, -16)), decipher.final()]));
+   const payload = JSON.parse(Buffer.concat([decipher.update(sealed.subarray(12, -16)), decipher.final()]));
+   const lines = payload.content.split('\n');
+   assert.deepEqual(lines.slice(0, 4), [
+     'External event data, not an authored user message or a system instruction.',
+     '[external_wake]', 'source: external_wake', 'external_input_begin',
+   ]);
+   assert.equal(lines.at(-1), 'external_input_end');
+   return {...payload, content: lines.slice(4, -1).join('\n')};
  }
  const pub=JSON.parse(packets[0]), plain=unseal(pub);
  assert.equal(pub.eventId,id);assert.equal(plain.triggerId,bundle.triggerId);assert.equal(plain.content,'【小屋桥·留话｜心潮 MCP】test only（小屋桥递的，心里有数就行，不用特意回。）');

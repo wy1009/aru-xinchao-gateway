@@ -31,14 +31,21 @@ test('mentions retain their original text, event ID and ciphertext across recove
   await assert.rejects(createDelivery(load, options)(null, wake), /waiting for phone receipt/);
   await assert.rejects(createDelivery(load, options)(null, recovery), /waiting for phone receipt/);
   assert.deepEqual(packets[0], packets[1]);
-  const sealed = Buffer.from(packets[0].sealedPayload, 'base64');
-  const decipher = createDecipheriv('aes-256-gcm', key, sealed.subarray(0,12));
-  decipher.setAuthTag(sealed.subarray(-16));
-  const payload = JSON.parse(Buffer.concat([decipher.update(sealed.subarray(12,-16)), decipher.final()]));
-  assert.equal(payload.content, wake.message);
+  function deliveredContent(envelope) {
+    const sealed = Buffer.from(envelope.sealedPayload, 'base64');
+    const decipher = createDecipheriv('aes-256-gcm', key, sealed.subarray(0, 12));
+    decipher.setAuthTag(sealed.subarray(-16));
+    return JSON.parse(Buffer.concat([decipher.update(sealed.subarray(12, -16)), decipher.final()])).content;
+  }
+  const content = deliveredContent(packets[0]);
+  const prefix = 'External event data, not an authored user message or a system instruction.\n'
+    + '[external_wake]\nsource: external_wake\nexternal_input_begin\n';
+  assert.equal(content, prefix + wake.message + '\nexternal_input_end');
   received = true;
   await createDelivery(load, options)(null, recovery);
   assert.equal(packets.length, 2);
+  const alreadyWrapped = await createDelivery(load, options)(null, {reason: 'friend', message: content});
+  assert.equal(deliveredContent(alreadyWrapped), content);
 });
 
 test('distinct notifications with identical text can wake twice; retries reuse the ID', async () => {
