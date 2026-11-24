@@ -10,7 +10,8 @@ from prompt_audit import PAGE_SIZE, page_records
 from usage_ledger import KINDS, summary
 
 BEIJING = timezone(timedelta(hours=8))
-FEEDS = {"gateway": ("发给模型", "/run/nian-audit-gateway"), "bridge": ("手机已收件", "/run/nian-audit-bridge")}
+FEEDS = {"gateway": ("发给模型", "/run/nian-audit-gateway"), "bridge": ("手机已收件", "/run/nian-audit-bridge"),
+         "emotion": ("情绪分类", "/run/nian-audit-gateway")}
 STYLE = """*{box-sizing:border-box}body{margin:auto;max-width:54rem;padding:1.25rem;color:#202821;background:#f7f7f3;font:16px/1.6 system-ui,sans-serif}h1{font-size:1.8rem;line-height:1.25}h2{font-size:1.25rem}p{margin:.45rem 0 1rem}article{border:1px solid #d6ddd6;background:white;border-radius:.65rem;padding:.7rem .9rem;margin:.55rem 0}a{color:#225b47}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f0f4ef;padding:.65rem;font:inherit}nav{display:flex;gap:1rem;flex-wrap:wrap}"""
 HEADERS = {"Cache-Control":"private, no-store", "Referrer-Policy":"no-referrer",
            "Content-Security-Policy":"default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'", "X-Frame-Options":"DENY"}
@@ -20,7 +21,7 @@ def stamp(at):
     return datetime.fromtimestamp(at, BEIJING).strftime("%m-%d %H:%M:%S")
 
 
-NAV = '<nav><a href="?feed=gateway">发给模型</a><a href="?feed=bridge">手机已收件</a><a href="?feed=usage">模型用量</a></nav>'
+NAV = '<nav><a href="?feed=gateway">发给模型</a><a href="?feed=bridge">手机已收件</a><a href="?feed=emotion">情绪分类</a><a href="?feed=usage">模型用量</a></nav>'
 
 
 def page_body(chunks):
@@ -81,7 +82,8 @@ async def prompt_log(request):
     except ValueError:
         page = 1
     try:
-        rows = page_records(directory, record_id, offset=(page - 1) * PAGE_SIZE, limit=PAGE_SIZE + 1)
+        rows = page_records(directory, record_id, offset=(page - 1) * PAGE_SIZE,
+                            limit=PAGE_SIZE + 1, emotion=feed == "emotion")
     except (sqlite3.Error, ValueError, OSError):
         return HTMLResponse("日志暂时无法读取", status_code=503, headers=HEADERS)
     if record_id is None:

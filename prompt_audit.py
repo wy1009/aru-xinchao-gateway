@@ -115,15 +115,24 @@ def log_reply(directory, record_id, entries):
         logging.getLogger("uvicorn.error").warning("Xinchao reply audit unavailable")
 
 
-def page_records(directory, record_id=None, *, offset=0, limit=PAGE_SIZE):
+def log_emotion(directory, turn_key, response_id, question, text):
+    record_id = f"emotion:{turn_key}:{response_id or uuid.uuid4().hex}"
+    try:
+        store(directory, record_id, time.time(), "情绪自评",
+              [[None, "user", "你的原话", question], [None, "assistant", "自评模型的响应", text]])
+    except (OSError, sqlite3.Error, ValueError):
+        logging.getLogger("uvicorn.error").warning("Xinchao emotion audit unavailable")
+
+
+def page_records(directory, record_id=None, *, offset=0, limit=PAGE_SIZE, emotion=False):
     cutoff = time.time() - WEEK
     with closing(connect(directory, "ro")) as db:
         if record_id is None:
-            return db.execute("SELECT id,at,status FROM audit WHERE at>? "
+            return db.execute("SELECT id,at,status FROM audit WHERE at>? AND (id GLOB 'emotion:*')=? "
                               "ORDER BY at DESC,rowid DESC LIMIT ? OFFSET ?",
-                              (cutoff, limit, offset)).fetchall()
-        row = db.execute("SELECT at,status,entries FROM audit WHERE id=? AND at>?",
-                         (record_id, cutoff)).fetchone()
+                              (cutoff, emotion, limit, offset)).fetchall()
+        row = db.execute("SELECT at,status,entries FROM audit WHERE id=? AND at>? AND (id GLOB 'emotion:*')=?",
+                         (record_id, cutoff, emotion)).fetchone()
         return (row[0], row[1], unpack(row[2])) if row else None
 
 

@@ -826,6 +826,51 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("SECRET", media[0][3])
         self.assertIn("照片", media[0][3])
 
+    async def test_emotion_log_keeps_only_question_and_raw_reply_even_when_unchanged(self):
+        import aru_prompt_log
+        import prompt_audit
+        raw = '{\n "type": "companionship", "tone": "calm"\n}'
+        posts = []
+        def route(req):
+            if req.url.path.endswith("/chat/completions"):
+                return httpx.Response(200, json={"id": req.headers["Idempotency-Key"],
+                    "choices": [{"finish_reason": "stop", "message": {"content": raw, "reasoning_content": "私有推理"}}]})
+            posts.append(req.url.path)
+            return httpx.Response(200, json={"classified": {"type": "companionship"}})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.queue()
+            directory = Path(tmp) / "prompt-audit"
+            directory.mkdir()
+            with sqlite3.connect(directory / "records.db") as audit_db:
+                audit_db.execute("CREATE TABLE audit(id TEXT PRIMARY KEY, at REAL, status TEXT, entries BLOB)")
+                audit_db.execute("INSERT INTO audit VALUES('chat',?, '对话', '[]')", (time.time(),))
+            with (patch.object(gateway, "DB", Path(tmp) / "turns.sqlite"),
+                  patch.dict(os.environ, XINCHAO_CHAT_API_KEY="fixture", NIAN_MIND_TOKEN="fixture")):
+                async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+                    app = SimpleNamespace(state=SimpleNamespace(db=db, client=client))
+                    for i, question in enumerate(["旧问题", " <主人>\n原话  ", aru_wake_message("主动事件")]):
+                        gateway.enqueue(db, str(i), "s", question, "日常聊天答复",
+                                        request_body={"messages": [{"role": "system", "content": "系统上下文"},
+                                                                   {"role": "user", "content": question}]})
+                        await gateway.process_turn(app, db.execute("SELECT * FROM turns WHERE id=?", (str(i),)).fetchone())
+            self.assertEqual(posts, ["/v1/conversation-event"])
+            rows = prompt_audit.page_records(directory, emotion=True)
+            self.assertEqual(len(rows), 2)
+            key = rows[0][0]
+            self.assertEqual(prompt_audit.page_records(directory, key, emotion=True)[2],
+                             [[None, "user", "你的原话", " <主人>\n原话  "],
+                              [None, "assistant", "自评模型的响应", raw]])
+            self.assertIsNone(prompt_audit.page_records(directory, key))
+            self.assertEqual([r[0] for r in prompt_audit.page_records(directory)], ["chat"])
+            with patch.dict(aru_prompt_log.FEEDS, emotion=("情绪分类", str(directory))):
+                detail = await aru_prompt_log.prompt_log(SimpleNamespace(query_params={"feed": "emotion", "id": key}))
+                self.assertIn("&lt;主人&gt;", detail.body.decode())
+            with patch.object(prompt_audit.time, "time", return_value=time.time() + prompt_audit.WEEK + 1):
+                self.assertEqual(prompt_audit.page_records(directory, emotion=True), [])
+                prompt_audit.expire(directory)
+            self.assertEqual(prompt_audit.page_records(directory, emotion=True), [])
+
     async def test_reply_audit_and_seven_day_retention(self):
         import prompt_audit as audit
         with tempfile.TemporaryDirectory() as temp:

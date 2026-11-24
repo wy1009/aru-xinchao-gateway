@@ -17,7 +17,7 @@ from pathlib import Path
 
 import httpx
 from anyio import CancelScope
-from prompt_audit import log_request, log_reply
+from prompt_audit import log_emotion, log_request, log_reply
 from usage_ledger import UsageCall
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -737,7 +737,8 @@ def save(db, sql, *params):
         db.execute(sql, params)
 
 
-async def model_json(client, key_id, inputs, max_tokens, *, purpose, object_output, use_chat_model=False):
+async def model_json(client, key_id, inputs, max_tokens, *, purpose, object_output, use_chat_model=False,
+                     emotion_question=None):
     key = os.environ.get("XINCHAO_CHAT_API_KEY", "")
     if not use_chat_model:
         key = os.environ.get("XINCHAO_ANALYSIS_API_KEY") or key
@@ -768,6 +769,11 @@ async def model_json(client, key_id, inputs, max_tokens, *, purpose, object_outp
         with CancelScope(shield=True):
             await asyncio.to_thread(meter.save)
     choice = response["choices"][0]
+    if emotion_question is not None:
+        text = (choice.get("message") or {}).get("content")
+        if isinstance(text, str):
+            await asyncio.to_thread(log_emotion, DB.parent / "prompt-audit", key_id,
+                                    response.get("id"), emotion_question, text)
     if choice.get("finish_reason") != "stop":
         raise AnalysisFormatError("incomplete model response")
     try:
@@ -870,7 +876,8 @@ async def process_turn(app, row):
             inputs = {"messages": [{"role": "system", "content": INTERACTION_PROMPT},
                                    {"role": "user", "content": exchange}]}
         tag = await model_json(client, "emotion-" + turn, inputs, 256,
-                               purpose="emotion", object_output=True, use_chat_model=full_context)
+                               purpose="emotion", object_output=True, use_chat_model=full_context,
+                               emotion_question=row["question"])
         encoded = await asyncio.to_thread(normalized_interaction, tag)
         save(db, "UPDATE turns SET mode='report',result=?,assessment_context=NULL,failures=0 WHERE id=?",
              encoded, turn)
