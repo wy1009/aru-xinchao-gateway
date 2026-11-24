@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import zlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -65,6 +66,10 @@ def load_interaction_prompt():
 
 ob_import = load_ob_import()
 INTERACTION_PROMPT = load_interaction_prompt()
+SELF_ASSESSMENT_PROMPT = (
+    "你现在正在与主人进行怎样的互动？你的情绪是怎样的？请用JSON格式输出，只输出 JSON，前后不包含任何其他字符。\n"
+    + INTERACTION_PROMPT[INTERACTION_PROMPT.index("type 只能是"):]
+)
 EMOTION_CHAR_LIMIT = 8000
 EMOTION_REPLY_RESERVE = 1000
 MEMORY_TARGET_TOKENS = 2 * ob_import._CHUNK_TARGET_TOKENS
@@ -224,7 +229,7 @@ def lineage(messages, index):
     return parent, prompt
 
 
-def enqueue(db, turn, session, question, answer, history=None):
+def enqueue(db, turn, session, question, answer, history=None, *, request_body=None):
     if not (question.strip() and answer.strip()):
         return
     group_id, parent_id, anchor = session, None, None
@@ -242,12 +247,17 @@ def enqueue(db, turn, session, question, answer, history=None):
     if cabin_reply:
         # The cabin already settled the interaction. Only the reply receipt needs delivery.
         question, answer = "", ""
+    context = None
+    if request_body is not None and not cabin_reply and not is_bridge_message(question):
+        # Keep the exact outbound prefix while the background assessment is pending.
+        prefix = {k: request_body[k] for k in ("messages", "tools", "functions") if k in request_body}
+        context = zlib.compress(json.dumps(prefix, ensure_ascii=False, separators=(",", ":")).encode(), 1)
     with db:
         db.execute(
             "INSERT OR IGNORE INTO turns(id,session,question,answer,group_id,parent_id,anchor,"
-            "memory_planned,memory_check,mode) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "memory_planned,memory_check,mode,assessment_context) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (turn, session, question, answer, group_id, parent_id, anchor,
-             int(not plan_memory), int(plan_memory), "cabin_reply" if cabin_reply else None),
+             int(not plan_memory), int(plan_memory), "cabin_reply" if cabin_reply else None, context),
         )
 
 
@@ -414,9 +424,10 @@ async def add_state(messages, turn, scope):
 
 
 class Completion:
-    def __init__(self, db, turn):
+    def __init__(self, db, turn, request_body=None):
         self.db = db
         self.turn = turn
+        self.request_body = request_body
         self.text = []
         self.reason = None
         self.tools = False
@@ -440,7 +451,9 @@ class Completion:
     def save(self):
         if self.turn and self.reason == "stop" and not self.tools:
             tid, session, _, question, history = self.turn
-            enqueue(self.db, tid, session, question, "".join(self.text), history)
+            enqueue(self.db, tid, session, question, "".join(self.text), history,
+                    request_body=self.request_body)
+            self.turn = None  # The terminal delta and [DONE] can both call save().
 
 
 class VisibleChoices:
@@ -656,7 +669,7 @@ async def chat(req: Request, *, organizer=False):
     # Match turns and run bridge hooks on the client input before rewriting the outbound copy.
     if not organizer:
         unwrap_selected_wakes(messages)
-    completed = OrganizerResult(db, body) if organizer else Completion(db, turn)
+    completed = OrganizerResult(db, body) if organizer else Completion(db, turn, body)
     client = req.app.state.client
     sent_at = time.time()
     try:
@@ -713,18 +726,15 @@ def save(db, sql, *params):
         db.execute(sql, params)
 
 
-async def model_json(client, key_id, prompt, content, max_tokens, *, object_output):
-    key = os.environ.get("XINCHAO_ANALYSIS_API_KEY") or os.environ.get(
-        "XINCHAO_CHAT_API_KEY", ""
-    )
+async def model_json(client, key_id, inputs, max_tokens, *, object_output, use_chat_model=False):
+    key = os.environ.get("XINCHAO_CHAT_API_KEY", "")
+    if not use_chat_model:
+        key = os.environ.get("XINCHAO_ANALYSIS_API_KEY") or key
     if not key:
         raise RuntimeError("provider key missing")
     payload = {
-        "model": ANALYSIS_MODEL,
-        "messages": [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": content},
-        ],
+        **inputs,
+        "model": MODEL if use_chat_model else ANALYSIS_MODEL,
         "max_tokens": max_tokens,
         "temperature": 0,
         "enable_thinking": False,
@@ -733,7 +743,7 @@ async def model_json(client, key_id, prompt, content, max_tokens, *, object_outp
     if object_output:
         payload["response_format"] = {"type": "json_object"}
     r = await client.post(
-        ANALYSIS + "/chat/completions",
+        (CHAT if use_chat_model else ANALYSIS) + "/chat/completions",
         headers={**bearer(key), "Idempotency-Key": key_id},
         json=payload,
     )
@@ -825,10 +835,26 @@ async def process_turn(app, row):
         return
     exchange = emotion_exchange(row["question"], row["answer"])
     if row["result"] is None:
-        tag = await model_json(client, "emotion-" + turn, INTERACTION_PROMPT, exchange,
-                               256, object_output=True)
+        full_context = row["assessment_context"] is not None
+        if full_context:
+            inputs = json.loads(zlib.decompress(row["assessment_context"]))
+            inputs["messages"].extend([
+                {"role": "assistant", "content": row["answer"]},
+                {"role": "user", "content": SELF_ASSESSMENT_PROMPT},
+            ])
+            if inputs.get("tools"):
+                inputs["tool_choice"] = "none"
+            if inputs.get("functions"):
+                inputs["function_call"] = "none"
+        else:
+            # Turns already queued by the previous release have no replayable prefix.
+            inputs = {"messages": [{"role": "system", "content": INTERACTION_PROMPT},
+                                   {"role": "user", "content": exchange}]}
+        tag = await model_json(client, "emotion-" + turn, inputs, 256,
+                               object_output=True, use_chat_model=full_context)
         encoded = await asyncio.to_thread(normalized_interaction, tag)
-        save(db, "UPDATE turns SET mode='report',result=?,failures=0 WHERE id=?", encoded, turn)
+        save(db, "UPDATE turns SET mode='report',result=?,assessment_context=NULL,failures=0 WHERE id=?",
+             encoded, turn)
     elif row["mode"] == "report":
         encoded = row["result"]
     else:
@@ -955,8 +981,8 @@ async def process_memory(app, row):
         items = await model_json(
             client,
             "memory-" + job,
-            ob_import.IMPORT_EXTRACT_PROMPT,
-            content,
+            {"messages": [{"role": "system", "content": ob_import.IMPORT_EXTRACT_PROMPT},
+                          {"role": "user", "content": content}]},
             ob_import._EXTRACT_MAX_TOKENS,
             object_output=False,
         )
@@ -1009,9 +1035,10 @@ async def run_job(app, table, row, process):
             + 1
         )
         permanent = status in (400, 404, 413, 422) or attempts >= 10
+        discard_context = ",assessment_context=NULL" if permanent and table == "turns" else ""
         save(
             db,
-            f"UPDATE {table} SET state=?,available=?,failures=?,error=? WHERE id=?",
+            f"UPDATE {table} SET state=?,available=?,failures=?,error=?{discard_context} WHERE id=?",
             "failed" if permanent else "pending",
             time.time() + min(1800, 5 * 2 ** min(attempts, 9)),
             attempts,
@@ -1098,6 +1125,7 @@ def setup_queue(db):
             session TEXT PRIMARY KEY, result TEXT NOT NULL)""")
         columns = {r[1] for r in db.execute("PRAGMA table_info(turns)")}
         additions = {
+            "assessment_context": "BLOB",
             "group_id": "TEXT",
             "anchor": "TEXT",
             "parent_id": "TEXT",

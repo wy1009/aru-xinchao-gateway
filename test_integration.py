@@ -307,12 +307,72 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                         app = SimpleNamespace(state=SimpleNamespace(db=db, client=client))
                         session = "another" if i == 6 else "room"
                         question = aru_wake_message("通知") if i == 7 else f"问题{i}"
-                        gateway.enqueue(db, str(i), session, question, f"答复{i}")
+                        gateway.enqueue(db, str(i), session, question, f"答复{i}",
+                                        request_body={"messages": [{"role": "user", "content": question}]})
                         row = db.execute("SELECT * FROM turns WHERE id=?", (str(i),)).fetchone()
+                        self.assertEqual(row["assessment_context"] is None, i == 7)
                         await gateway.process_turn(app, row)
-            self.assertEqual([c.args[3] for c in classify.await_args_list],
-                             [f"她说：问题{i}\n他回：答复{i}" for i in range(7)])
+            self.assertEqual([c.args[2]["messages"][0]["content"] for c in classify.await_args_list],
+                             [f"问题{i}" for i in range(7)])
             self.assertEqual([e["event_id"] for e in posted], ["0", "2", "3", "4", "6"])
+
+    async def test_self_assessment_replays_final_tool_leg_after_restart(self):
+        tools = [{"type": "function", "function": {"name": "weather", "parameters": {"type": "object"}}}]
+        messages = [
+            {"role": "system", "content": "Aru 设定"},
+            {"role": "user", "content": "很久以前" * 3100},
+            {"role": "assistant", "content": "之前的回答"},
+            {"role": "user", "content": [{"type": "text", "text": "今天天气怎么样？"}]},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"type": "function", "id": "call-1", "function": {"name": "weather", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "20℃"},
+        ]
+        answer = "二十度。" + "完整答复" * 2500
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "queue"
+            db = self.queue(path)
+            completed = gateway.Completion(db, ("turn", "session", 3, "今天天气怎么样？", None),
+                                           {"messages": messages, "tools": tools, "tool_choice": "required"})
+            for part, reason in [(answer[:4], None), (answer[4:], "stop")]:
+                completed.accept({"choices": [{"delta": {"content": part}, "finish_reason": reason}]}, True)
+            completed.save()
+            db.close()
+            db = self.queue(path)
+            self.addCleanup(db.close)
+            requests = []
+
+            def route(req):
+                if req.url.path.endswith("/chat/completions"):
+                    self.assertEqual(req.headers["Authorization"], "Bearer chat-fixture")
+                    requests.append(json.loads(req.content))
+                    if len(requests) == 1:
+                        return httpx.Response(503)
+                    return httpx.Response(200, json={"choices": [{"finish_reason": "stop",
+                        "message": {"content": '{"type":"companionship","tone":"calm"}'}}]})
+                self.assertIsNone(db.execute("SELECT assessment_context FROM turns").fetchone()[0])
+                return httpx.Response(200, json={"classified": {"type": "companionship"}})
+
+            with patch.dict(os.environ, XINCHAO_CHAT_API_KEY="chat-fixture", XINCHAO_ANALYSIS_API_KEY="other",
+                            NIAN_MIND_TOKEN="fixture"):
+                async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+                    app = SimpleNamespace(state=SimpleNamespace(db=db, client=client))
+                    for _ in range(2):
+                        row = db.execute("SELECT * FROM turns").fetchone()
+                        self.assertIsNotNone(row["assessment_context"])
+                        await gateway.run_job(app, "turns", row, gateway.process_turn)
+            self.assertEqual(len(requests), 2)
+            self.assertEqual(requests[0], requests[1])
+            sent = requests[0]
+            self.assertEqual(sent["messages"][:-2], messages)
+            self.assertEqual(sent["messages"][-2], {"role": "assistant", "content": answer})
+            prompt = sent["messages"][-1]
+            self.assertEqual(prompt["role"], "user")
+            opening, rules = prompt["content"].split("\n", 1)
+            self.assertEqual(opening, "你现在正在与主人进行怎样的互动？你的情绪是怎样的？请用JSON格式输出，只输出 JSON，前后不包含任何其他字符。")
+            self.assertTrue(rules.startswith("type 只能是"))
+            self.assertEqual(rules, gateway.INTERACTION_PROMPT.split("\n", 1)[1])
+            self.assertEqual((sent["tools"], sent["tool_choice"]), (tools, "none"))
+            self.assertEqual(db.execute("SELECT mind_done FROM turns").fetchone()[0], 1)
 
     async def test_cabin_reply_only_after_final_text_and_idempotent_on_retry(self):
         question = aru_wake_message("【小屋桥·互动｜心潮 MCP】收到一个拥抱。")
@@ -461,7 +521,7 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
 
             def model_stub(request):
                 data = json.loads(request.content)
-                if request.url.host == "api.siliconflow.cn":
+                if request.url.host == "api.siliconflow.cn" and "response_format" not in data:
                     self.assertEqual(data["reasoning_effort"], "medium")
                     self.assertIs(data["enable_thinking"], True)
                     self.assertEqual(data["thinking_budget"], 4096)
@@ -482,15 +542,14 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                     )
                 self.assertIs(data["enable_thinking"], False)
                 self.assertNotIn("thinking_budget", data)
-                system, user = (m["content"] for m in data["messages"])
-                self.assertNotIn("【此刻，小禾的状态】", user)
-                self.assertNotIn("【此刻，主人说】", user)
-                if system == gateway.INTERACTION_PROMPT:
-                    if not calls:
-                        self.assertEqual(
-                            user, "她说：" + question + "\n他回：我知道了。"
-                        )
-                    elif user.startswith("她说：冷却中的问题"):
+                if data["messages"][-1]["content"] == gateway.SELF_ASSESSMENT_PROMPT:
+                    self.assertEqual(data["messages"][:-2], forwarded[0])
+                    self.assertEqual(data["messages"][-2], {"role": "assistant", "content": "我知道了。"})
+                    result = classification
+                    calls.append("emotion")
+                elif data["messages"][0]["content"] == gateway.INTERACTION_PROMPT:
+                    user = data["messages"][1]["content"]
+                    if user.startswith("她说：冷却中的问题"):
                         self.assertTrue(user.startswith("她说：冷却中的问题\n他回：回答"))
                         self.assertEqual(len(user), 8000)
                     else:
@@ -504,6 +563,7 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                     result = {**classification, "tone": "focused"} if user.startswith("她说：到期的这一轮") else classification
                     calls.append("emotion")
                 else:
+                    system, user = (m["content"] for m in data["messages"])
                     self.assertEqual(system, gateway.ob_import.IMPORT_EXTRACT_PROMPT)
                     self.assertTrue(
                         user.startswith(
