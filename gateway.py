@@ -18,6 +18,7 @@ from pathlib import Path
 import httpx
 from anyio import CancelScope
 from prompt_audit import log_request, log_reply
+from usage_ledger import UsageCall
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -570,7 +571,7 @@ class OrganizerResult(VisibleChoices):
             )
 
 
-async def relay(upstream, completed, audit=None):
+async def relay(upstream, completed, audit=None, meter=None):
     # OpenAI SSE events are UTF-8. Preserve their fields, including usage and tool-call deltas.
     data = []
     done = False
@@ -587,6 +588,8 @@ async def relay(upstream, completed, audit=None):
                 else:
                     try:
                         chunk = json.loads(event)
+                        if meter is not None:
+                            meter.observe(chunk, streaming=True)
                         if audit is not None:
                             audit.accept(chunk, True)
                         completed.accept(chunk, True)
@@ -602,6 +605,8 @@ async def relay(upstream, completed, audit=None):
     finally:
         with CancelScope(shield=True):
             await upstream.aclose()
+            if meter is not None:
+                await asyncio.to_thread(meter.save)
             if audit is not None:
                 await asyncio.to_thread(audit.persist)
 
@@ -691,11 +696,13 @@ async def chat(req: Request, *, organizer=False):
                                             state_index, sent_at, f"模型服务 HTTP {upstream.status_code}")
         if record_id and upstream.is_success:
             audit = ReplyAudit(directory, record_id)
+    meter = UsageCall(DB.parent / "prompt-audit", "organizer" if organizer else "chat",
+                      CHAT, MODEL, body.get("n") or 1) if upstream.is_success else None
     if upstream.is_success and upstream.headers.get("content-type", "").startswith(
         "text/event-stream"
     ):
         return StreamingResponse(
-            relay(upstream, completed, audit),
+            relay(upstream, completed, audit, meter),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
@@ -703,6 +710,7 @@ async def chat(req: Request, *, organizer=False):
         raw = await upstream.aread()
         if upstream.is_success:
             chunk = json.loads(raw)
+            meter.observe(chunk)
             if audit is not None:
                 audit.accept(chunk, False)
                 await asyncio.to_thread(audit.persist)
@@ -714,7 +722,10 @@ async def chat(req: Request, *, organizer=False):
             media_type=upstream.headers.get("content-type", "application/json"),
         )
     finally:
-        await upstream.aclose()
+        with CancelScope(shield=True):
+            await upstream.aclose()
+            if meter is not None:
+                await asyncio.to_thread(meter.save)
 
 
 class AnalysisFormatError(ValueError):
@@ -726,7 +737,7 @@ def save(db, sql, *params):
         db.execute(sql, params)
 
 
-async def model_json(client, key_id, inputs, max_tokens, *, object_output, use_chat_model=False):
+async def model_json(client, key_id, inputs, max_tokens, *, purpose, object_output, use_chat_model=False):
     key = os.environ.get("XINCHAO_CHAT_API_KEY", "")
     if not use_chat_model:
         key = os.environ.get("XINCHAO_ANALYSIS_API_KEY") or key
@@ -742,13 +753,21 @@ async def model_json(client, key_id, inputs, max_tokens, *, object_output, use_c
     # OB's official prompt requests a top-level JSON array.
     if object_output:
         payload["response_format"] = {"type": "json_object"}
+    endpoint = CHAT if use_chat_model else ANALYSIS
+    meter = UsageCall(DB.parent / "prompt-audit", purpose, endpoint, payload["model"])
     r = await client.post(
-        (CHAT if use_chat_model else ANALYSIS) + "/chat/completions",
+        endpoint + "/chat/completions",
         headers={**bearer(key), "Idempotency-Key": key_id},
         json=payload,
     )
     r.raise_for_status()
-    choice = r.json()["choices"][0]
+    try:
+        response = r.json()
+        meter.observe(response)
+    finally:
+        with CancelScope(shield=True):
+            await asyncio.to_thread(meter.save)
+    choice = response["choices"][0]
     if choice.get("finish_reason") != "stop":
         raise AnalysisFormatError("incomplete model response")
     try:
@@ -851,7 +870,7 @@ async def process_turn(app, row):
             inputs = {"messages": [{"role": "system", "content": INTERACTION_PROMPT},
                                    {"role": "user", "content": exchange}]}
         tag = await model_json(client, "emotion-" + turn, inputs, 256,
-                               object_output=True, use_chat_model=full_context)
+                               purpose="emotion", object_output=True, use_chat_model=full_context)
         encoded = await asyncio.to_thread(normalized_interaction, tag)
         save(db, "UPDATE turns SET mode='report',result=?,assessment_context=NULL,failures=0 WHERE id=?",
              encoded, turn)
@@ -984,7 +1003,7 @@ async def process_memory(app, row):
             {"messages": [{"role": "system", "content": ob_import.IMPORT_EXTRACT_PROMPT},
                           {"role": "user", "content": content}]},
             ob_import._EXTRACT_MAX_TOKENS,
-            object_output=False,
+            purpose="memory", object_output=False,
         )
         if (
             not isinstance(items, list)
