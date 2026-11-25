@@ -251,7 +251,8 @@ def enqueue(db, turn, session, question, answer, history=None, *, request_body=N
     context = None
     if request_body is not None and not cabin_reply and not is_bridge_message(question):
         # Keep the exact outbound prefix while the background assessment is pending.
-        prefix = {k: request_body[k] for k in ("messages", "tools", "functions") if k in request_body}
+        fields = ("messages", "tools", "tool_choice", "parallel_tool_calls", "functions", "function_call")
+        prefix = {k: request_body[k] for k in fields if k in request_body}
         context = zlib.compress(json.dumps(prefix, ensure_ascii=False, separators=(",", ":")).encode(), 1)
     with db:
         db.execute(
@@ -732,6 +733,10 @@ class AnalysisFormatError(ValueError):
     pass
 
 
+class AnalysisToolCall(AnalysisFormatError):
+    pass
+
+
 def save(db, sql, *params):
     with db:
         db.execute(sql, params)
@@ -769,8 +774,12 @@ async def model_json(client, key_id, inputs, max_tokens, *, purpose, object_outp
         with CancelScope(shield=True):
             await asyncio.to_thread(meter.save)
     choice = response["choices"][0]
+    message = choice.get("message") or {}
+    if (choice.get("finish_reason") in ("tool_calls", "function_call")
+            or message.get("tool_calls") or message.get("function_call")):
+        raise AnalysisToolCall("assessment returned a tool call instead of JSON")
     if emotion_question is not None:
-        text = (choice.get("message") or {}).get("content")
+        text = message.get("content")
         if isinstance(text, str):
             await asyncio.to_thread(log_emotion, DB.parent / "prompt-audit", key_id,
                                     response.get("id"), emotion_question, text)
@@ -839,6 +848,31 @@ def finish_mind_turn(db, turn, *, session=None, reported=None):
         clear_delivered(db, [turn])
 
 
+async def assess_emotion(app, row, inputs, full_context):
+    async def request(suffix=""):
+        return await model_json(app.state.client, "emotion-" + row["id"] + suffix, inputs, 256,
+                                purpose="emotion", object_output=True, use_chat_model=full_context,
+                                emotion_question=row["question"])
+
+    choice_field = "tool_choice" if inputs.get("tools") else "function_call"
+    choice = inputs.get(choice_field)
+    has_tools = bool(inputs.get("tools") or inputs.get("functions"))
+    forced = choice == "required" or (
+        isinstance(choice, dict) and
+        (choice.get("type") != "allowed_tools" or (choice.get("allowed_tools") or {}).get("mode") == "required")
+    )
+    if row["mode"] != "assessment_text" and not (has_tools and forced):
+        try:
+            return await request()
+        except AnalysisToolCall:
+            if not has_tools or choice == "none":
+                raise
+            # Keep retries on the text-only path even after a restart.
+            save(app.state.db, "UPDATE turns SET mode='assessment_text' WHERE id=?", row["id"])
+    inputs[choice_field] = "none"
+    return await request("-text")
+
+
 async def process_turn(app, row):
     db, client = app.state.db, app.state.client
     turn, session = row["id"], row["session"]
@@ -867,17 +901,11 @@ async def process_turn(app, row):
                 {"role": "assistant", "content": row["answer"]},
                 {"role": "user", "content": SELF_ASSESSMENT_PROMPT},
             ])
-            if inputs.get("tools"):
-                inputs["tool_choice"] = "none"
-            if inputs.get("functions"):
-                inputs["function_call"] = "none"
         else:
             # Turns already queued by the previous release have no replayable prefix.
             inputs = {"messages": [{"role": "system", "content": INTERACTION_PROMPT},
                                    {"role": "user", "content": exchange}]}
-        tag = await model_json(client, "emotion-" + turn, inputs, 256,
-                               purpose="emotion", object_output=True, use_chat_model=full_context,
-                               emotion_question=row["question"])
+        tag = await assess_emotion(app, row, inputs, full_context)
         encoded = await asyncio.to_thread(normalized_interaction, tag)
         save(db, "UPDATE turns SET mode='report',result=?,assessment_context=NULL,failures=0 WHERE id=?",
              encoded, turn)
@@ -1060,7 +1088,8 @@ async def run_job(app, table, row, process):
             ).fetchone()[0]
             + 1
         )
-        permanent = status in (400, 404, 413, 422) or attempts >= 10
+        permanent = (status in (400, 404, 413, 422) or attempts >= 10
+                     or (table == "turns" and isinstance(exc, AnalysisToolCall)))
         discard_context = ",assessment_context=NULL" if permanent and table == "turns" else ""
         save(
             db,

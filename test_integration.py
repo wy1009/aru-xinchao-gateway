@@ -332,7 +332,8 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
             path = Path(tmp) / "queue"
             db = self.queue(path)
             completed = gateway.Completion(db, ("turn", "session", 3, "今天天气怎么样？", None),
-                                           {"messages": messages, "tools": tools, "tool_choice": "required"})
+                                           {"messages": messages, "tools": tools, "tool_choice": "auto",
+                                            "parallel_tool_calls": False})
             for part, reason in [(answer[:4], None), (answer[4:], "stop")]:
                 completed.accept({"choices": [{"delta": {"content": part}, "finish_reason": reason}]}, True)
             completed.save()
@@ -371,8 +372,67 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(opening, "你现在正在与主人进行怎样的互动？你的情绪是怎样的？请用JSON格式输出，只输出 JSON，前后不包含任何其他字符。")
             self.assertTrue(rules.startswith("type 只能是"))
             self.assertEqual(rules, gateway.INTERACTION_PROMPT.split("\n", 1)[1])
-            self.assertEqual((sent["tools"], sent["tool_choice"]), (tools, "none"))
+            self.assertEqual((sent["tools"], sent["tool_choice"]), (tools, "auto"))
+            self.assertIs(sent["parallel_tool_calls"], False)
             self.assertEqual(db.execute("SELECT mind_done FROM turns").fetchone()[0], 1)
+
+    async def test_assessment_tool_request_is_discarded_and_text_retry_survives_restart(self):
+        fn = {"name": "read_inbox", "parameters": {"type": "object"}}
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "queue"
+                field = "function_call" if legacy else "tool_choice"
+                body = {"messages": [{"role": "user", "content": "你好"}]}
+                body.update({"functions": [fn]} if legacy else {"tools": [{"type": "function", "function": fn}]})
+                db = self.queue(path)
+                gateway.enqueue(db, "turn", "room", "你好", "早上好", request_body=body)
+                calls, reports = [], []
+
+                def route(req):
+                    data = json.loads(req.content)
+                    if req.url.path.endswith("/v1/conversation-event"):
+                        reports.append(data["event_id"])
+                        return httpx.Response(200, json={"classified": {"type": "companionship"}})
+                    self.assertTrue(req.url.path.endswith("/chat/completions"))
+                    calls.append((req.headers["Idempotency-Key"], data.get(field)))
+                    if len(calls) == 1:
+                        self.assertNotIn(field, data)
+                        call = {"name": fn["name"], "arguments": "{}"}
+                        msg = ({"function_call": call} if legacy else
+                               {"tool_calls": [{"id": "call1", "type": "function", "function": call}]})
+                        reason = "stop" if legacy else "tool_calls"
+                        return httpx.Response(200, json={"choices": [{"message": msg, "finish_reason": reason}]})
+                    if len(calls) == 2:
+                        return httpx.Response(503)
+                    return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {
+                        "content": '{"type":"companionship","tone":"calm"}'}}]})
+
+                with patch.dict(os.environ, XINCHAO_CHAT_API_KEY="fixture", NIAN_MIND_TOKEN="fixture"):
+                    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+                        for _ in range(2):
+                            app = SimpleNamespace(state=SimpleNamespace(db=db, client=client))
+                            row = db.execute("SELECT * FROM turns").fetchone()
+                            await gateway.run_job(app, "turns", row, gateway.process_turn)
+                            db.close()
+                            db = self.queue(path)
+                self.assertEqual(calls, [("emotion-turn", None), ("emotion-turn-text", "none"),
+                                         ("emotion-turn-text", "none")])
+                self.assertEqual(reports, ["turn"])
+                self.assertEqual(db.execute("SELECT mind_done FROM turns").fetchone()[0], 1)
+                db.close()
+
+    async def test_forced_tool_assessment_uses_one_text_call(self):
+        app = SimpleNamespace(state=SimpleNamespace(client=None))
+        row = {"id": "t", "mode": None, "question": "早"}
+        for field, settings in (
+            ("tool_choice", {"tools": ["tool"], "tool_choice": "required"}),
+            ("tool_choice", {"tools": ["tool"], "tool_choice": {"type": "function", "function": {"name": "f"}}}),
+            ("function_call", {"functions": ["fn"], "function_call": {"name": "f"}}),
+        ):
+            with self.subTest(settings=settings), patch.object(gateway, "model_json", new_callable=AsyncMock) as model:
+                await gateway.assess_emotion(app, row, settings, True)
+                model.assert_awaited_once()
+                self.assertEqual(model.await_args.args[2][field], "none")
 
     async def test_cabin_reply_only_after_final_text_and_idempotent_on_retry(self):
         question = aru_wake_message("【小屋桥·互动｜心潮 MCP】收到一个拥抱。")
