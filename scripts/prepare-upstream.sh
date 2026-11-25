@@ -12,14 +12,21 @@ if [ "$(git -C "$target" rev-parse HEAD)" != "$pin" ]; then
     echo "Expected xinchao-nian at $pin" >&2
     exit 1
 fi
-for patch in upstream.patch aru-dream.patch; do
+apply_patch_if_needed() {
+    patch=$1
     if git -C "$target" apply --reverse --check "$repo/$patch" 2>/dev/null; then
         echo "$patch already applied"
     else
         git -C "$target" apply --check "$repo/$patch"
         git -C "$target" apply "$repo/$patch"
     fi
-done
+}
+apply_patch_if_needed upstream.patch
+# The window upgrade changes lines introduced by the original dream patch.
+if ! git -C "$target" apply --reverse --check "$repo/aru-dream-window.patch" 2>/dev/null; then
+    apply_patch_if_needed aru-dream.patch
+    apply_patch_if_needed aru-dream-window.patch
+fi
 for module in aru_backup aru_backup_ob aru_enrichment aru_source_time aru_wikilinks nian_memory; do
     install -m 0644 "$repo/$module.py" "$target/ombre-brain/src/$module.py"
 done

@@ -21,6 +21,44 @@ class SourceTimeTest(unittest.TestCase):
 
 
 class SourceTimeSyncTest(unittest.IsolatedAsyncioTestCase):
+    async def test_dream_window_and_rotation(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from aru_backup_ob import dream_material_page, identifiers, open_state, recent_dream_candidates
+        from aru_source_time import KIND
+
+        db = open_state(":memory:")
+        self.addCleanup(db.close)
+        hour = 3_600_000
+        buckets = {}
+        ids = []
+        # The archive can be years old; one record is exactly on the inclusive boundary.
+        for i, end in enumerate([400 * hour, 200 * hour, 199 * hour, 198 * hour, 197 * hour,
+                                 196 * hour, 195 * hour, 152 * hour, 152 * hour - 1]):
+            sid = str(i)
+            bid, marker = identifiers(KIND, {"id": sid, "part": 0})
+            db.execute("INSERT INTO links VALUES (?,?,0,?,'hash',1)", (KIND, sid, bid))
+            db.execute("INSERT INTO source_time VALUES (?,'hash',?,?)", (bid, end - hour, end))
+            buckets[bid] = {"metadata": {"grow_batch_id": marker, "dont_surface": i == 0},
+                            "content": f"素材{i}"}
+            ids.append(bid)
+        manager = SimpleNamespace(get=AsyncMock(side_effect=buckets.get))
+        pool = await recent_dream_candidates(manager, db)
+        self.assertEqual([m["id"] for m in pool], ids[1:8])
+        after, seen = None, []
+        for _ in range(4):
+            page = dream_material_page(pool, after)
+            self.assertEqual((page["candidateCount"], page["windowEndMs"]), (7, 200 * hour))
+            seen.extend(m["id"] for m in page["memories"])
+            after = seen[-1]
+        self.assertEqual(seen, ids[1:8] + ids[1:2])
+
+        # A newer eligible import moves the window past the previous cursor.
+        buckets[ids[0]]["metadata"]["dont_surface"] = False
+        only = await recent_dream_candidates(manager, db)
+        self.assertEqual([m["id"] for m in dream_material_page(only, after)["memories"]], ids[:1])
+        self.assertEqual(dream_material_page([], after)["memories"], [])
+
     async def test_dream_candidates_follow_source_conversations_across_imports(self):
         import tempfile
         from aru_backup import OWNER, LABEL

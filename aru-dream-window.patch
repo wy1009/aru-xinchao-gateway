@@ -1,0 +1,70 @@
+--- a/xinchao/src/server.js
++++ b/xinchao/src/server.js
+@@ -351,7 +351,7 @@
+ 
+     if (config.dreamEnabled && dreamAllowed(state, now, config.dreamMinIntervalHours, config.dreamMaxPerDay)) {
+       let material = '';
+-      let usedAruFallback = false;
++      let aruCursor = null;
+       let sourceOmbreBucketIds = [];
+       if (!config.shadowMode && config.ombre.readEnabled) {
+         try {
+@@ -369,11 +369,11 @@
+         catch (error) { log('ombre_read_failed', { message: error.message }); }
+         if (!material.trim()) {
+           try {
+-            const recent = await ombre.recentAruDreamMaterial(state.recentDreams);
++            const recent = await ombre.recentAruDreamMaterial(state.aruDreamCursor);
+             material = recent.text;
+             sourceOmbreBucketIds = recent.bucketIds;
+-            usedAruFallback = recent.bucketIds.length > 0;
+-            log('dream_aru_material', { count: recent.bucketIds.length });
++            aruCursor = recent.bucketIds.at(-1);
++            log('dream_aru_material', { count: recent.bucketIds.length, candidates: recent.candidateCount, windowEndMs: recent.windowEndMs });
+           } catch (error) { log('dream_aru_material_failed', { message: error.message }); }
+         }
+       }
+@@ -429,10 +429,12 @@
+         at: now,
+       }, (latest) => {
+         if (!dreamAllowed(latest, now, config.dreamMinIntervalHours, config.dreamMaxPerDay)) return latest;
+-        return recordDream(latest, dream);
++        const next = recordDream(latest, dream);
++        if (aruCursor && dream.source === 'model') next.aruDreamCursor = aruCursor;
++        return next;
+       });
+       dreamCreated = true;
+-      log('dream_settled', { source: dream.source, shadow: config.shadowMode, usedBreath: Boolean(material) && !usedAruFallback, usedAruFallback, revision: state.revision });
++      log('dream_settled', { source: dream.source, shadow: config.shadowMode, usedBreath: Boolean(material) && !aruCursor, usedAruFallback: Boolean(aruCursor), revision: state.revision });
+ 
+       // 3.3：梦做完不在凌晨推。攒着，到她常来的点前后再推"昨晚梦到……"（见下面 pendingDreamPush）。
+       if (!config.shadowMode && config.bark.enabled) {
+--- a/xinchao/src/ombre-client.js
++++ b/xinchao/src/ombre-client.js
+@@ -194,20 +194,19 @@
+     return { text: out.trim(), bucketIds: picked.map((p) => p.id).filter(Boolean), domains: [...new Set(picked.flatMap((p) => p.domains))], total: blocks.length, kept: picked.length };
+   }
+ 
+-  async recentAruDreamMaterial(recentDreams) {
++  async recentAruDreamMaterial(after) {
+     const url = new URL('/internal/aru-backup/dream-material', this.config.url);
++    if (after) url.searchParams.set('after', after);
+     const response = await fetch(url, {
+       headers: { Authorization: `Bearer ${this.config.token}`, Accept: 'application/json' },
+       signal: AbortSignal.timeout(10000),
+     });
+     if (!response.ok) throw new Error(`Aru dream material: HTTP ${response.status}`);
+-    const { memories } = await response.json();
+-    const used = new Set(recentDreams.slice(-2).flatMap((d) => d.sourceOmbreBucketIds ?? []));
+-    // Both lists retain the source-conversation order returned by OB, newest first.
+-    const picked = [...memories.filter((m) => !used.has(m.id)), ...memories.filter((m) => used.has(m.id))].slice(0, 2);
++    const { memories, candidateCount, windowEndMs } = await response.json();
+     return {
+-      text: picked.map((m) => `${m.period}\n${m.text}`).join('\n\n'),
+-      bucketIds: picked.map((m) => m.id),
++      text: memories.map((m) => `${m.period}\n${m.text}`).join('\n\n'),
++      bucketIds: memories.map((m) => m.id),
++      candidateCount, windowEndMs,
+     };
+   }
+ 

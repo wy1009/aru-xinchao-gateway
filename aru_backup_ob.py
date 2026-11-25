@@ -233,10 +233,13 @@ async def recent_dream_candidates(manager, db):
         ORDER BY t.end_ms DESC, t.start_ms DESC, l.bucket
     """, (source_time.KIND,))
     candidates = []
+    cutoff = None
     for bid, sid, start, end in rows:
         expected, marker = identifiers(source_time.KIND, {"id": sid, "part": 0})
         if bid != expected or not source_time.valid([start, end]):
             continue
+        if cutoff is not None and end < cutoff:
+            break
         bucket = await manager.get(bid)
         meta = bucket["metadata"] if bucket else {}
         if (meta.get("grow_batch_id") != marker or meta.get("deleted_at") or meta.get("dont_surface")
@@ -245,10 +248,19 @@ async def recent_dream_candidates(manager, db):
         footer = source_time.footer((start, end))
         text = strip_wikilinks(bucket["content"].strip().removesuffix(footer)).strip()
         if text:
-            candidates.append({"id": bid, "period": footer.strip().removeprefix("> "), "text": text[:900]})
-        if len(candidates) == 6:
-            break
+            if cutoff is None:
+                cutoff = end - 48 * 60 * 60 * 1000
+            candidates.append({"id": bid, "endMs": end, "period": footer.strip().removeprefix("> "), "text": text[:900]})
     return candidates
+
+
+def dream_material_page(candidates, after):
+    count = len(candidates)
+    if not count:
+        return {"memories": [], "candidateCount": 0, "windowEndMs": None}
+    start = next((i + 1 for i, item in enumerate(candidates) if item["id"] == after), 0)
+    picked = [candidates[(start + i) % count] for i in range(min(2, count))]
+    return {"memories": picked, "candidateCount": count, "windowEndMs": candidates[0]["endMs"]}
 
 
 def register(mcp, shared):
@@ -276,11 +288,12 @@ def register(mcp, shared):
             return JSONResponse({}, status_code=401)
         path = Path(os.environ["OMBRE_CONFIG_PATH"]).resolve().parent / "aru-backup-sync.sqlite"
         async with lock:
-            if not path.is_file():
-                return JSONResponse({"memories": []})
-            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
-                memories = await recent_dream_candidates(shared.bucket_mgr, db)
-        return JSONResponse({"memories": memories}, headers={"Cache-Control": "no-store"})
+            candidates = []
+            if path.is_file():
+                with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                    candidates = await recent_dream_candidates(shared.bucket_mgr, db)
+        return JSONResponse(dream_material_page(candidates, req.query_params.get("after")),
+                            headers={"Cache-Control": "no-store"})
 
     @mcp.custom_route("/internal/aru-backup/enrich", methods=["POST"])
     async def enrich(req):

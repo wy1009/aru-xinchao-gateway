@@ -1,2 +1,3 @@
 upstream.patch -text -whitespace
 aru-dream.patch -text -whitespace
+aru-dream-window.patch -text -whitespace
