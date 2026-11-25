@@ -1,0 +1,363 @@
+diff --git a/ombre-brain/frontend/dashboard.html b/ombre-brain/frontend/dashboard.html
+index a14ff4e..0eeb334 100644
+--- a/ombre-brain/frontend/dashboard.html
++++ b/ombre-brain/frontend/dashboard.html
+@@ -5380,7 +5380,7 @@ function updateChick(total) { if (window.ObPet) ObPet.setCount(total || 0); }
+     top.forEach(function(b){ v += (b.valence!=null?b.valence:0.5); a += (b.arousal!=null?b.arousal:0.3); });
+     v/=top.length; a/=top.length;
+     if (v>=0.62) return a>=0.55 ? {label:'雀跃',     emoji:'✨'} : {label:'暖洋洋',   emoji:'☺️'};
+-    if (v<=0.40) return a>=0.55 ? {label:'有点烦躁', emoji:'😖'} : {label:'有点低落', emoji:'🥺'};
++    if (v<=0.40) return a>=0.55 ? {label:'有点心绪不宁', emoji:'😖'} : {label:'有点低落', emoji:'🥺'};
+     return            a>=0.55 ? {label:'微微紧绷', emoji:'😬'} : {label:'平平静静', emoji:'🍃'};
+   }
+ 
+diff --git a/xinchao/src/bridge-queue.js b/xinchao/src/bridge-queue.js
+index 5096ede..0a61f41 100644
+--- a/xinchao/src/bridge-queue.js
++++ b/xinchao/src/bridge-queue.js
+@@ -2,6 +2,7 @@
+ // 代码地图见 src/README.md。
+ 
+ import { randomUUID } from 'node:crypto';
++import { normalizeQueueWording } from './restless-wording.js';
+ import { StateStore } from './state-store.js';
+ 
+ export const BRIDGE_SERVER_PROTOCOL = 'xinchao-bridge-server/1';
+@@ -39,7 +40,7 @@ export function bridgeDeliveryFromDashboard(payload = {}, now = new Date()) {
+ 
+ export class BridgeQueue {
+   constructor(path, { maxEntries = 500, ttlHours = 168 } = {}) {
+-    this.store = new StateStore(path, initialQueue);
++    this.store = new StateStore(path, initialQueue, normalizeQueueWording);
+     this.maxEntries = maxEntries;
+     this.ttlHours = ttlHours;
+   }
+diff --git a/xinchao/src/emotion.js b/xinchao/src/emotion.js
+index 33072a5..973309f 100644
+--- a/xinchao/src/emotion.js
++++ b/xinchao/src/emotion.js
+@@ -129,7 +129,7 @@ export function emotionLabel(valence, arousal) {
+   const a = clamp(arousal);
+   if (v >= 0.68 && a >= 0.50) return '雀跃';
+   if (v >= 0.68) return '安心';
+-  if (v <= 0.38 && a >= 0.50) return '烦躁';
++  if (v <= 0.38 && a >= 0.50) return '心绪不宁';
+   if (v <= 0.38) return '低落';
+   if (v >= 0.58 && a <= 0.22) return '松弛';
+   if (a >= 0.62) return '紧绷';
+@@ -477,10 +477,10 @@ export function emotionNuance(state, now = new Date()) {
+     const top = Object.entries(state?.drives ?? {}).filter(([k, val]) => FLAVOR[k] && Number(val) >= 0.6).sort((x, y) => Number(y[1]) - Number(x[1]))[0];
+     return [summary.shown, top && !(summary.shown === '想念' && top[0] === 'possess') ? FLAVOR[top[0]] : ''].filter(Boolean).join('，');
+   }
+-  // 标签已经很具体（低落/烦躁/雀跃/安心/紧绷/倦）时只补一个轴；"平静/松弛"太笼统，两个轴都补
++  // 标签已经很具体（低落/心绪不宁/雀跃/安心/紧绷/倦）时只补一个轴；"平静/松弛"太笼统，两个轴都补
+   const parts = [label];
+   if (label === '平静' || label === '松弛') { if (vWord !== '平') parts[0] = `${label}${vWord}`; parts.push(aWord); }
+-  else if (label === '低落' || label === '烦躁') parts.push(aWord);
++  else if (label === '低落' || label === '心绪不宁') parts.push(aWord);
+   else if (label === '安心' || label === '雀跃') { if (vWord !== '暖') parts.push(vWord); }
+   const drives = Object.entries(state?.drives ?? {}).filter(([k, val]) => FLAVOR[k] && Number(val) >= 0.6).sort((x, y) => Number(y[1]) - Number(x[1]));
+   if (drives.length) parts.push(FLAVOR[drives[0][0]]);
+diff --git a/xinchao/src/model-client.js b/xinchao/src/model-client.js
+index ca6b496..c6b14e7 100644
+--- a/xinchao/src/model-client.js
++++ b/xinchao/src/model-client.js
+@@ -1,6 +1,7 @@
+ // 【连接 AI】调用小模型的客户端：给互动打标签、写梦、写月度回顾时用。模型和 key 在 .env 里配。
+ // 代码地图见 src/README.md。
+ 
++import { emotionWording } from './restless-wording.js';
+ import { readFileSync } from 'node:fs';
+ 
+ export class ModelClient {
+@@ -62,11 +63,11 @@ export class ModelClient {
+     const text = payload.choices?.[0]?.message?.content ?? '';
+     const parsed = parseJson(text);
+     return {
+-      dream: String(parsed.dream ?? '').slice(0, 4000),
+-      residue: String(parsed.residue ?? '').slice(0, 1200),
+-      awareness: String(parsed.awareness ?? '').slice(0, 1200),
++      dream: emotionWording(String(parsed.dream ?? '')).slice(0, 4000),
++      residue: emotionWording(String(parsed.residue ?? '')).slice(0, 1200),
++      awareness: emotionWording(String(parsed.awareness ?? '')).slice(0, 1200),
+       lucidity: normalizedLucidity(parsed.lucidity),
+-      image: String(parsed.image ?? '').replace(/\s+/g, ' ').trim().slice(0, 24) || null,
++      image: emotionWording(String(parsed.image ?? '')).replace(/\s+/g, ' ').trim().slice(0, 24) || null,
+       mood: normalizedMood(parsed.mood),
+       source: 'model',
+       model: this.config.name
+@@ -183,7 +184,7 @@ export class ModelClient {
+     if (!response.ok) throw new Error(`model request failed: HTTP ${response.status}`);
+     const payload = await response.json();
+     const parsed = parseJson(payload.choices?.[0]?.message?.content ?? '');
+-    return { message: String(parsed.message ?? '').slice(0, 900), source: 'model' };
++    return { message: emotionWording(String(parsed.message ?? '')).slice(0, 900), source: 'model' };
+   }
+ 
+   request(body) {
+@@ -240,7 +241,7 @@ function formatRecentMessages(items) {
+ }
+ 
+ function cleanShortMessage(value) {
+-  const text = String(value ?? '')
++  const text = emotionWording(String(value ?? ''))
+     .replace(/^```[a-z]*\s*/i, '')
+     .replace(/```$/i, '')
+     .replace(/^["“]|["”]$/g, '')
+diff --git a/xinchao/src/restless-wording.js b/xinchao/src/restless-wording.js
+new file mode 100644
+index 0000000..41f3613
+--- /dev/null
++++ b/xinchao/src/restless-wording.js
+@@ -0,0 +1,59 @@
++// Normalize the service's own labels and generated text. User quotes and event IDs are data.
++export const restlessLine = '刚才的事过去了，心里还没平静下来。';
++const oldLabel = '烦躁';
++const label = '心绪不宁';
++
++export function emotionWording(text) {
++  return typeof text === 'string' ? text.replaceAll(oldLabel, label) : text;
++}
++
++function renameLabel(item, field = 'label') {
++  if (item?.[field] === oldLabel) item[field] = label;
++}
++
++function updateText(item, fields) {
++  for (const key of fields) {
++    if (typeof item?.[key] === 'string') item[key] = emotionWording(item[key]);
++  }
++}
++
++export function normalizeMindWording(state) {
++  renameLabel(state.emotion);
++  renameLabel(state.emotion?.pendingLabel);
++  renameLabel(state.selfSignals?.emotionEpisode);
++  for (const sample of state.emotionJournal ?? []) renameLabel(sample);
++  for (const mark of state.emotionMarks ?? []) renameLabel(mark, 'word');
++  for (const day of Object.values(state.emotionDays ?? {})) {
++    if (day.labels && Object.hasOwn(day.labels, oldLabel)) {
++      day.labels[label] = (day.labels[label] ?? 0) + day.labels[oldLabel];
++      delete day.labels[oldLabel];
++    }
++  }
++  for (const entry of state.selfSignals?.history ?? []) {
++    if (entry.kind === 'emotion_shift' && entry.subject === oldLabel) {
++      entry.subject = label;
++      entry.text = restlessLine;
++    } else {
++      updateText(entry, ['text']);
++    }
++  }
++  for (const dream of state.recentDreams ?? []) {
++    updateText(dream, ['dream', 'residue', 'awareness', 'summary', 'image']);
++  }
++  updateText(state.pendingAwareness, ['residue']);
++  return state;
++}
++
++// A queued event keeps its deduplication key and receipt state, even across an upgrade.
++export function normalizeQueueWording(queue) {
++  for (const item of queue.deliveries ?? []) {
++    if (item.reason !== 'self_signal') continue;
++    if (item.eventId?.startsWith('self-emotion_shift-烦躁-')) {
++      const suffix = /\s此刻：[\s\S]*$/u.exec(item.message)?.[0] ?? '';
++      item.message = restlessLine + emotionWording(suffix);
++    } else {
++      updateText(item, ['message']);
++    }
++  }
++  return queue;
++}
+diff --git a/xinchao/src/self-signals.js b/xinchao/src/self-signals.js
+index 7c83e77..f72759f 100644
+--- a/xinchao/src/self-signals.js
++++ b/xinchao/src/self-signals.js
+@@ -9,7 +9,7 @@
+ // 五种信号，每种一个"发生"的时刻，不是裸阈值：
+ //   drive_peak     某个驱力从 0.60 以下涨到 ≥0.80 并持续 2 小时（每维每天最多一次）。
+ //                  稳态趴在天花板上不算——没有释放的驱力永远在顶上，那不是"冲"，是平线（2026-09-05 线上实测）。
+-//   emotion_shift  情绪掉进低落/烦躁并停留 30 分钟；或从低落回到安心（一个回合一次，2 小时内最多一条）
++//   emotion_shift  情绪掉进低落/心绪不宁并停留 30 分钟；或从低落回到安心（一个回合一次，2 小时内最多一条）
+ //   longing        挂念 ≥0.6（一个空档一次；降到 0.35 以下才算空档结束）
+ //   wake_residue   醒来且梦有余韵（每次醒来一次）
+ //   awareness      复盘日（默认周日）攒下的觉察候选，一周一次，只说有几条、看不看随他
+@@ -21,6 +21,7 @@
+ 
+ import { DRIVE_KEYS, DRIVE_SHORT, driveLevel } from './dimensions.js';
+ import { computeLonging, localDayAndHour, topDrives, driveTrend, shownDrives } from './engine.js';
++import { restlessLine } from './restless-wording.js';
+ import { emotionSummary } from './emotion.js';
+ import { isReviewDay } from './awareness.js';
+ import { MIXED_TEMPLATES, driveSub, mixedLine, trackMixed } from './mixed-feelings.js';
+@@ -39,7 +40,7 @@ const EMOTION_GAP_MS = 2 * H;
+ const LONGING_ON = 0.6;
+ const LONGING_OFF = 0.35;
+ const TEMPLATE_REPEAT_MS = 48 * H;
+-const LOW_LABELS = new Set(['低落', '烦躁']);
++const LOW_LABELS = new Set(['低落', '心绪不宁']);
+ const HIGH_LABELS = new Set(['安心', '雀跃']);
+ 
+ export { DRIVE_SHORT };   // 定义挪到 dimensions.js，这里保留导出
+@@ -75,8 +76,8 @@ const PEAK_TEMPLATES = {
+ const EMOTION_TEMPLATES = {
+   low: ['这会儿是低落的，{cause}之后一直没起来。', '心里沉着，{cause}那阵子留下来的。', '有点提不起劲，{cause}之后就这样了。'],
+   low_nocause: ['这会儿是低落的，说不上为什么。', '心里沉着，没什么具体的事。'],
+-  restless: ['这会儿有点烦躁，{cause}之后就静不下来。', '静不下来，{cause}那口气还没散。'],
+-  restless_nocause: ['这会儿有点烦躁，没什么具体的事。'],
++  restless: [restlessLine],
++  restless_nocause: [restlessLine],
+   recover: ['缓过来了，刚才那阵低落过去了。', '心里松下来了，不像刚才那样沉。', '回到安心里了。'],
+ };
+ const LONGING_TEMPLATES = ['过了她平时来的点了，还没见人，有点想她。', '她这个点一般会来，今天还没来，我在等。', '门口那盏灯一直亮着，她还没游过来。'];
+@@ -168,7 +169,7 @@ export function detectSelfSignals(input, now = new Date(), options = {}) {
+     }
+   }
+ 
+-  // 2. 情绪转折：进低落/烦躁停 30 分钟一次；从低落回到安心一次。
++  // 2. 情绪转折：进低落/心绪不宁停 30 分钟一次；从低落回到安心一次。
+   const emotion = emotionSummary(state, now);
+   const label = emotion.label;
+   if (LOW_LABELS.has(label)) {
+diff --git a/xinchao/src/server.js b/xinchao/src/server.js
+index 9c575c0..d504b44 100644
+--- a/xinchao/src/server.js
++++ b/xinchao/src/server.js
+@@ -1,6 +1,7 @@
+ // 【服务底座】HTTP 服务入口：所有接口的路由、定时结算、把上面各块接到一起。
+ // 代码地图见 src/README.md。
+ 
++import { normalizeMindWording } from './restless-wording.js';
+ import { createServer } from 'node:http';
+ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+ import { loadConfig, validateConfig } from './config.js';
+@@ -55,7 +56,7 @@ if (config.serviceToken.length < 32) {
+   throw new Error('SERVICE_TOKEN must be at least 32 characters — generate one: openssl rand -hex 32');
+ }
+ 
+-const store = new StateStore(config.statePath, () => newState());
++const store = new StateStore(config.statePath, () => newState(), normalizeMindWording);
+ const model = new ModelClient(config.model);
+ // 4.3 做梦可以单独换模型：DREAM_MODEL_* 没配的项沿用 MODEL_*
+ const dreamModel = new ModelClient({
+diff --git a/xinchao/src/state-store.js b/xinchao/src/state-store.js
+index 68d7c22..259c106 100644
+--- a/xinchao/src/state-store.js
++++ b/xinchao/src/state-store.js
+@@ -7,14 +7,16 @@ import { dirname } from 'node:path';
+ export class StateStore {
+   #queue = Promise.resolve();
+ 
+-  constructor(path, factory) {
++  constructor(path, factory, normalize = null) {
+     this.path = path;
+     this.factory = factory;
++    this.normalize = normalize;
+   }
+ 
+   async read() {
+     try {
+-      return JSON.parse(await readFile(this.path, 'utf8'));
++      const state = JSON.parse(await readFile(this.path, 'utf8'));
++      return this.normalize ? this.normalize(state) : state;
+     } catch (error) {
+       if (error.code !== 'ENOENT') throw error;
+       const state = this.factory();
+diff --git a/xinchao/test/engine-3.3-emotion.test.js b/xinchao/test/engine-3.3-emotion.test.js
+index b9ba219..297a529 100644
+--- a/xinchao/test/engine-3.3-emotion.test.js
++++ b/xinchao/test/engine-3.3-emotion.test.js
+@@ -97,7 +97,7 @@ test('grief and anger drives lower the resting valence without any growth term',
+ test('labels cover the quadrants', () => {
+   assert.equal(emotionLabel(0.8, 0.7), '雀跃');
+   assert.equal(emotionLabel(0.8, 0.2), '安心');
+-  assert.equal(emotionLabel(0.2, 0.7), '烦躁');
++  assert.equal(emotionLabel(0.2, 0.7), '心绪不宁');
+   assert.equal(emotionLabel(0.2, 0.2), '低落');
+   assert.equal(emotionLabel(0.5, 0.7), '紧绷');
+   assert.equal(emotionLabel(0.5, 0.1), '倦');
+diff --git a/xinchao/test/now-compact-3.3.test.js b/xinchao/test/now-compact-3.3.test.js
+index 48d16da..b744fe1 100644
+--- a/xinchao/test/now-compact-3.3.test.js
++++ b/xinchao/test/now-compact-3.3.test.js
+@@ -90,7 +90,7 @@ test('emotion line is specific: bands and a drive flavour, never a bare 平静',
+   const now = buildNowCompact(state, at(0));
+   assert.match(now.text, /情绪：平静偏暖，有点起伏，底下一直想她、想黏着她/);
+   const low = baseState(); low.emotion.valence = 0.3; low.emotion.arousal = 0.7;
+-  assert.match(buildNowCompact(low, at(0)).text, /情绪：烦躁，绷着/);
++  assert.match(buildNowCompact(low, at(0)).text, /情绪：心绪不宁，绷着/);
+ });
+ 
+ test('envelope and now-block mention the box count and surfaced titles only', () => {
+diff --git a/xinchao/test/restless-wording.test.js b/xinchao/test/restless-wording.test.js
+new file mode 100644
+index 0000000..a9a2489
+--- /dev/null
++++ b/xinchao/test/restless-wording.test.js
+@@ -0,0 +1,46 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import { normalizeMindWording, normalizeQueueWording, restlessLine } from '../src/restless-wording.js';
++import { newState } from '../src/engine.js';
++import { emotionSummary } from '../src/emotion.js';
++import { buildDashboardSnapshot } from '../src/dashboard-projection.js';
++import { buildContextEnvelope } from '../src/context-envelope.js';
++import { ModelClient } from '../src/model-client.js';
++
++test('legacy episode, trend and dream keep their meaning across dashboard, context and dream generation', async () => {
++  const now = new Date(), state = newState(now);
++  Object.assign(state.emotion, { label: '烦躁', valence: 0.2, arousal: 0.8 });
++  state.emotion.pendingLabel = {label: '烦躁', since: now.toISOString()};
++  state.emotionDays = {today: {labels: {'烦躁': 4, '心绪不宁': 1}}};
++  state.emotionJournal = [{at: now.toISOString(), label:'烦躁', valence:0.2, arousal:0.8}];
++  state.selfSignals = {emotionEpisode: {label:'烦躁', signaled:true}, history:[{kind:'emotion_shift', subject:'烦躁', text:'静不下来，争执那口气还没散。'}]};
++  state.recentDreams = [{id:'dream1', residue:'有点烦躁'}];
++  normalizeMindWording(state);
++  const once = structuredClone(state);
++  normalizeMindWording(state);
++  assert.deepEqual(state, once);
++  assert.deepEqual(state.emotionDays.today.labels, {'心绪不宁':5});
++  assert.deepEqual(state.selfSignals.emotionEpisode, {label:'心绪不宁', signaled:true});
++  const view = buildDashboardSnapshot(state, {}, now);
++  assert.equal(view.emotion.journal[0].label, '心绪不宁');
++  assert.equal(view.signals.recent[0].text, restlessLine);
++  const ctx = await buildContextEnvelope({state, mode:'turn', now});
++  assert.match(JSON.stringify(ctx), /心绪不宁/);
++  assert.doesNotMatch(JSON.stringify(ctx), /烦躁/);
++  const model = new ModelClient({enabled:true, apiKey:'fixture', maxInputChars:2000});
++  model.request = async body => {
++    assert.match(body.messages.at(-1).content, /入睡时的心情：心绪不宁/);
++    return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify({dream:'有些烦躁',residue:'烦躁'})}}]})};
++  };
++  const dream = await model.generateDream({state, emotion:emotionSummary(state,now), topDrives:[]});
++  assert.equal(dream.residue, '心绪不宁');
++  assert.equal(dream.dream, '有些心绪不宁');
++});
++
++test('queued wakes keep receipt identity and authored letters keep their words', () => {
++  const eventId='self-emotion_shift-烦躁-1';
++  const queue={deliveries:[{eventId, reason:'self_signal', status:'delivered', message:'争执那口气还没散。 此刻：情绪 烦躁'}, {reason:'user_note',message:'我有点烦躁'}]};
++  normalizeQueueWording(queue);
++  assert.deepEqual(queue.deliveries[0], {eventId,reason:'self_signal',status:'delivered',message:restlessLine+' 此刻：情绪 心绪不宁'});
++  assert.equal(queue.deliveries[1].message, '我有点烦躁');
++});
+diff --git a/xinchao/test/self-signals-3.3.test.js b/xinchao/test/self-signals-3.3.test.js
+index ef07ed3..6f87ed5 100644
+--- a/xinchao/test/self-signals-3.3.test.js
++++ b/xinchao/test/self-signals-3.3.test.js
+@@ -38,13 +38,13 @@ test('emotion shift: low held 30 min fires once, recovery fires once, 2h gap bet
+   let state = baseState();
+   state = applyConversationEvent(state, ev('conflict', 'c1'), at(0)).state;
+   state = applyConversationEvent(state, ev('conflict', 'c2'), at(0.01)).state;
+-  assert.ok(['低落', '烦躁'].includes(state.emotion.label), state.emotion.label);
++  assert.ok(['低落', '心绪不宁'].includes(state.emotion.label), state.emotion.label);
+   let r = detectSelfSignals(state, at(0.1));
+   assert.equal(r.signals.length, 0);
+   r = detectSelfSignals(r.state, at(0.6));
+   assert.equal(r.signals.length, 1);
+   assert.equal(r.signals[0].kind, 'emotion_shift');
+-  assert.match(r.signals[0].text, /争执/);
++  assert.equal(r.signals[0].text.split("\n")[0], "刚才的事过去了，心里还没平静下来。");
+   r = detectSelfSignals(r.state, at(1));
+   assert.equal(r.signals.length, 0);
+   let recovered = r.state;

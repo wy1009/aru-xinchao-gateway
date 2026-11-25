@@ -27,6 +27,7 @@ if ! git -C "$target" apply --reverse --check "$repo/aru-dream-window.patch" 2>/
     apply_patch_if_needed aru-dream.patch
     apply_patch_if_needed aru-dream-window.patch
 fi
+apply_patch_if_needed restless-wording.patch
 for module in aru_backup aru_backup_ob aru_enrichment aru_source_time aru_wikilinks nian_memory; do
     install -m 0644 "$repo/$module.py" "$target/ombre-brain/src/$module.py"
 done
