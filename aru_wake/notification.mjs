@@ -26,6 +26,9 @@ function stateNotice({message, sourceEventId = ''}) {
   const drive = /^(?:self-drive_peak|drive-prompt)-([a-z_]+)-/.exec(sourceEventId);
   const signal = /^self-([a-z_]+)-(.+)-\d+$/.exec(sourceEventId);
   const kind = signal?.[1];
+  if (kind === 'emotion_shift' && signal[2] === '烦躁') {
+    return '心绪不宁：刚才的事过去了，心里还没平静下来。';
+  }
   let label = driveLabels.get(drive?.[1]) ?? signalLabels.get(kind);
   if (kind === 'emotion_shift') label = signal[2] === 'recover' ? '心情好转' : signal[2];
 
