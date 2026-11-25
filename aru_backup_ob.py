@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 from collections import Counter
+from contextlib import closing
 from pathlib import Path
 
 from starlette.responses import JSONResponse
@@ -220,7 +221,40 @@ async def sync(manager, db, payload):
     return result
 
 
+async def recent_dream_candidates(manager, db):
+    from utils import strip_wikilinks
+
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_time'").fetchone():
+        return []
+    rows = db.execute("""
+        SELECT l.bucket, l.source_id, t.start_ms, t.end_ms
+        FROM links l JOIN source_time t ON t.bucket=l.bucket AND t.source_hash=l.content_hash
+        WHERE l.active=1 AND l.kind=? AND l.part=0
+        ORDER BY t.end_ms DESC, t.start_ms DESC, l.bucket
+    """, (source_time.KIND,))
+    candidates = []
+    for bid, sid, start, end in rows:
+        expected, marker = identifiers(source_time.KIND, {"id": sid, "part": 0})
+        if bid != expected or not source_time.valid([start, end]):
+            continue
+        bucket = await manager.get(bid)
+        meta = bucket["metadata"] if bucket else {}
+        if (meta.get("grow_batch_id") != marker or meta.get("deleted_at") or meta.get("dont_surface")
+                or meta.get("type") == "archived" or {"技术", "数字", "编程", "事务"}.intersection(meta.get("domain") or [])):
+            continue
+        footer = source_time.footer((start, end))
+        text = strip_wikilinks(bucket["content"].strip().removesuffix(footer)).strip()
+        if text:
+            candidates.append({"id": bid, "period": footer.strip().removeprefix("> "), "text": text[:900]})
+        if len(candidates) == 6:
+            break
+    return candidates
+
+
 def register(mcp, shared):
+    from auth_policy import build_mcp_token_validator
+
+    sidecar_only = build_mcp_token_validator(lambda *_: False)
     lock = asyncio.Lock()
 
     analysis_lock = asyncio.Lock()
@@ -235,11 +269,23 @@ def register(mcp, shared):
     def connect():
         return open_state(Path(os.environ["OMBRE_CONFIG_PATH"]).parent / "aru-backup-sync.sqlite")
 
+    @mcp.custom_route("/internal/aru-backup/dream-material", methods=["GET"])
+    async def dream_material(req):
+        auth = req.headers.get("authorization", "")
+        if not auth.startswith("Bearer ") or not sidecar_only(auth[7:]):
+            return JSONResponse({}, status_code=401)
+        path = Path(os.environ["OMBRE_CONFIG_PATH"]).resolve().parent / "aru-backup-sync.sqlite"
+        async with lock:
+            if not path.is_file():
+                return JSONResponse({"memories": []})
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                memories = await recent_dream_candidates(shared.bucket_mgr, db)
+        return JSONResponse({"memories": memories}, headers={"Cache-Control": "no-store"})
+
     @mcp.custom_route("/internal/aru-backup/enrich", methods=["POST"])
     async def enrich(req):
         if not authenticated(req):
             return JSONResponse({}, status_code=401)
-        from contextlib import closing
         with closing(connect()) as db:
             if (await req.json()).get("mode") == "status":
                 return JSONResponse(ai.progress(db))

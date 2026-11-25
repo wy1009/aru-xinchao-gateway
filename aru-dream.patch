@@ -1,0 +1,72 @@
+--- a/xinchao/src/server.js
++++ b/xinchao/src/server.js
+@@ -351,6 +351,7 @@
+ 
+     if (config.dreamEnabled && dreamAllowed(state, now, config.dreamMinIntervalHours, config.dreamMaxPerDay)) {
+       let material = '';
++      let usedAruFallback = false;
+       let sourceOmbreBucketIds = [];
+       if (!config.shadowMode && config.ombre.readEnabled) {
+         try {
+@@ -366,6 +367,15 @@
+           log('dream_material', { digestTotal: digest.total, kept: digest.kept, domains: digest.domains.slice(0, 8).join(',') });
+         }
+         catch (error) { log('ombre_read_failed', { message: error.message }); }
++        if (!material.trim()) {
++          try {
++            const recent = await ombre.recentAruDreamMaterial(state.recentDreams);
++            material = recent.text;
++            sourceOmbreBucketIds = recent.bucketIds;
++            usedAruFallback = recent.bucketIds.length > 0;
++            log('dream_aru_material', { count: recent.bucketIds.length });
++          } catch (error) { log('dream_aru_material_failed', { message: error.message }); }
++        }
+       }
+       let farMaterial = '';
+       if (!config.shadowMode && config.ombre.readEnabled) {
+@@ -422,7 +432,7 @@
+         return recordDream(latest, dream);
+       });
+       dreamCreated = true;
+-      log('dream_settled', { source: dream.source, shadow: config.shadowMode, usedBreath: Boolean(material), revision: state.revision });
++      log('dream_settled', { source: dream.source, shadow: config.shadowMode, usedBreath: Boolean(material) && !usedAruFallback, usedAruFallback, revision: state.revision });
+ 
+       // 3.3：梦做完不在凌晨推。攒着，到她常来的点前后再推"昨晚梦到……"（见下面 pendingDreamPush）。
+       if (!config.shadowMode && config.bark.enabled) {
+--- a/xinchao/src/ombre-client.js
++++ b/xinchao/src/ombre-client.js
+@@ -192,6 +192,23 @@
+       out += line;
+     }
+     return { text: out.trim(), bucketIds: picked.map((p) => p.id).filter(Boolean), domains: [...new Set(picked.flatMap((p) => p.domains))], total: blocks.length, kept: picked.length };
++  }
++
++  async recentAruDreamMaterial(recentDreams) {
++    const url = new URL('/internal/aru-backup/dream-material', this.config.url);
++    const response = await fetch(url, {
++      headers: { Authorization: `Bearer ${this.config.token}`, Accept: 'application/json' },
++      signal: AbortSignal.timeout(10000),
++    });
++    if (!response.ok) throw new Error(`Aru dream material: HTTP ${response.status}`);
++    const { memories } = await response.json();
++    const used = new Set(recentDreams.slice(-2).flatMap((d) => d.sourceOmbreBucketIds ?? []));
++    // Both lists retain the source-conversation order returned by OB, newest first.
++    const picked = [...memories.filter((m) => !used.has(m.id)), ...memories.filter((m) => used.has(m.id))].slice(0, 2);
++    return {
++      text: picked.map((m) => `${m.period}\n${m.text}`).join('\n\n'),
++      bucketIds: picked.map((m) => m.id),
++    };
+   }
+ 
+   // 一条远期的小事：让梦有可以跳跃的另一头。30 天以前，只要一条。
+--- a/xinchao/src/model-client.js
++++ b/xinchao/src/model-client.js
+@@ -36,7 +36,7 @@
+       emotion ? `入睡时的心情：${emotion.label}（愉悦 ${emotion.valence}，唤醒 ${emotion.arousal}）` : '',
+       `当前动态欲望：${JSON.stringify(topDrives)}`,
+       `当前意识状态：${state.consciousness}`,
+-      `记忆正在消化的东西（近两天）：${memory || '没有取得新的记忆材料'}`,
++      `可供入梦的记忆片段（有来源时间时按原时间理解）：${memory || '没有取得新的记忆材料'}`,
+       far ? `远处的一件小事：${far}` : '',
+     ].filter(Boolean).join('\n');
+ 

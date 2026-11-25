@@ -21,6 +21,41 @@ class SourceTimeTest(unittest.TestCase):
 
 
 class SourceTimeSyncTest(unittest.IsolatedAsyncioTestCase):
+    async def test_dream_candidates_follow_source_conversations_across_imports(self):
+        import tempfile
+        from aru_backup import OWNER, LABEL
+        from aru_backup_ob import open_state, recent_dream_candidates, sync
+        from bucket_manager import BucketManager
+
+        with tempfile.TemporaryDirectory() as temp:
+            db = open_state(":memory:")
+            self.addCleanup(db.close)
+            manager = BucketManager({"buckets_dir": temp})
+            kind = "结构化记忆"
+            def item(sid):
+                return {"id": sid, "part": 0, "name": sid, "content": "# " + sid + "\n\n在[[北京]]见面。",
+                        "tags": ["Aru", LABEL, kind]}
+
+            rows = [item(s) for s in ("a", "b", "c", "unknown", "hidden")]
+            # Entirely old conversations; b started first and ended most recently.
+            times = {"a": [5000, 5200], "b": [1000, 9000], "c": [6000, 6500], "hidden": [8000, 9500]}
+            payload = {"owner": OWNER, "at": 100, "apply": True, "collections": {kind: rows}, "source_times": times}
+            await sync(manager, db, payload)
+            ids = dict(db.execute("SELECT source_id,bucket FROM links"))
+            await manager.update(ids["hidden"], dont_surface=True)
+            candidates = await recent_dream_candidates(manager, db)
+            self.assertEqual([m["id"] for m in candidates], [ids["b"], ids["c"], ids["a"]])
+            self.assertIn("北京", candidates[0]["text"])
+            self.assertNotIn("[[", candidates[0]["text"])
+            self.assertNotIn("来源对话", candidates[0]["text"])
+            self.assertIn("1970-01-01", candidates[0]["period"])
+
+            rows[0]["content"] = "编辑后的摘要"
+            await sync(manager, db, {**payload, "at": 101, "collections": {kind: rows[:1]},
+                                     "source_times": {"a": times["a"]}})
+            latest = await recent_dream_candidates(manager, db)
+            self.assertEqual([(m["id"], m["text"]) for m in latest], [(ids["a"], "编辑后的摘要")])
+
     async def test_same_backup_can_fill_times_and_retain_wikilinks(self):
         import json
         import tempfile

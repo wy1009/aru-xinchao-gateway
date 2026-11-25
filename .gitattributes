@@ -1,1 +1,2 @@
 upstream.patch -text -whitespace
+aru-dream.patch -text -whitespace
