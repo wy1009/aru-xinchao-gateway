@@ -12,14 +12,13 @@ from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from starlette.routing import Mount, Route
 
-from paimem_upload import app as full_archive_upload
+from aru_archive_upload import app as full_archive_upload
 from aru_prompt_log import prompt_log
 from aru_enrich_job import queue
 from aru_inbox import dest, path, pending, receive, saved
 
 NO_CACHE = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
-PAIMEM_SYNC = os.environ.get("ARU_PAIMEM_SYNC_ENABLED") == "1"
-PAGE = Path(__file__).with_name("paimem_portal.html" if PAIMEM_SYNC else "aru_portal.html").read_text()
+PAGE = Path(__file__).with_name("aru_portal.html").read_text()
 PASSWORD_DIGEST = os.environ["INBOX_DIGEST"]
 OB_SYNC_ENABLED = os.environ.get("ARU_OB_SYNC_ENABLED", "1") != "0"
 OB_SYNC_PATHS = {path, path + "/status", path + "/upload", path + "/enrich"}
@@ -48,7 +47,7 @@ async def index(request):
 
 async def status(request):
     try:
-        last = json.loads((dest / ("paimem-receipt.json" if PAIMEM_SYNC else "receipt.json")).read_text())
+        last = json.loads((dest / "receipt.json").read_text())
     except FileNotFoundError:
         last = None
     state = "syncing" if saved.exists() else "uploading" if pending.exists() else "ready"
@@ -84,7 +83,7 @@ async def lifespan(app):
 from wake_import import wake_import
 
 routes = Starlette(lifespan=lifespan, routes=[
-    Mount(path + "/paimem", app=full_archive_upload),
+    Mount(path + "/archive", app=full_archive_upload),
     Route(path + "/xinchao-log", prompt_log),
     Route(path + "/xinchao", wake_import, methods=["GET","POST"]),
     Route(path, index), Route(path + "/", index), Route(path + "/status", status),
@@ -101,9 +100,7 @@ async def app(scope, receive_body, send):
                 **NO_CACHE, "WWW-Authenticate": 'Basic realm="Aru Backup", charset="UTF-8"',
             })
             return await response(scope, receive_body, send)
-        target = scope["path"].rstrip("/")
-        paimem_route = PAIMEM_SYNC and target in {path, path + "/status", path + "/upload"}
-        if not OB_SYNC_ENABLED and target in OB_SYNC_PATHS and not paimem_route:
+        if not OB_SYNC_ENABLED and scope["path"].rstrip("/") in OB_SYNC_PATHS:
             response = PlainTextResponse("OB 已停用，备份同步和记忆补全已暂停。",
                                          status_code=503, headers=NO_CACHE)
             return await response(scope, receive_body, send)

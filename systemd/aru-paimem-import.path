@@ -1,7 +1,0 @@
-[Unit]
-Description=Watch new Aru backups for PaiMem
-[Path]
-PathExists=/var/lib/aru-backup-inbox/archive.polarisarchive
-Unit=aru-paimem-import.service
-[Install]
-WantedBy=multi-user.target

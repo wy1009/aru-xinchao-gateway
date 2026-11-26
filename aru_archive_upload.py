@@ -17,8 +17,8 @@ from starlette.routing import Route
 
 CHUNK = 4 * 1024**2
 RESERVE = 1024**3
-ROOT = Path(os.environ["STATE_DIRECTORY"]) / "paimem-uploads"
-PAGE = Path(__file__).with_name("paimem_upload.html").read_text()
+ROOT = Path(os.environ["STATE_DIRECTORY"]) / "archive-uploads"
+PAGE = Path(__file__).with_name("aru_archive_upload.html").read_text()
 HEAD = {"Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer",
         "X-Frame-Options": "DENY", "Content-Security-Policy":
         "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"}
