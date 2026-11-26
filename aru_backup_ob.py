@@ -221,6 +221,24 @@ async def sync(manager, db, payload):
     return result
 
 
+def eligible_dream_bucket(bucket):
+    if not bucket:
+        return False
+    meta = bucket["metadata"]
+    if meta.get("dont_surface") or meta.get("deleted_at") or meta.get("type") == "archived":
+        return False
+    tags = meta.get("tags") or []
+    if isinstance(tags, str):
+        tags = tags.replace("，", ",").split(",")
+    if meta.get("source") == "xinchao-dream" or any(
+        str(tag).strip().casefold() in {"dream", "梦境"} for tag in tags
+    ):
+        return False
+    # Older hold entries can lack origin metadata. Match the dream writer's format.
+    content = (bucket.get("content") or "").lstrip()
+    return not (content.startswith("梦境：") and "\n梦境余韵：" in content)
+
+
 async def recent_dream_candidates(manager, db):
     from utils import strip_wikilinks
 
@@ -242,8 +260,8 @@ async def recent_dream_candidates(manager, db):
             break
         bucket = await manager.get(bid)
         meta = bucket["metadata"] if bucket else {}
-        if (meta.get("grow_batch_id") != marker or meta.get("deleted_at") or meta.get("dont_surface")
-                or meta.get("type") == "archived" or {"技术", "数字", "编程", "事务"}.intersection(meta.get("domain") or [])):
+        if (meta.get("grow_batch_id") != marker or not eligible_dream_bucket(bucket)
+                or {"技术", "数字", "编程", "事务"}.intersection(meta.get("domain") or [])):
             continue
         footer = source_time.footer((start, end))
         text = strip_wikilinks(bucket["content"].strip().removesuffix(footer)).strip()

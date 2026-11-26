@@ -66,9 +66,9 @@ external_input_end
 
 Caddy 把公网 HTTPS 的 `/nian/*` 转发给网关。OB 的预分析记忆接收接口只供网关在本机调用，校验独立内部令牌。服务使用各自的 Linux 账号。环境配置位于 root 专用的 `/etc/xinchao-nian/`。生产依赖使用 OB 发行版的 Python 锁文件和主机已有的 Node，未安装 Docker。
 
-睡眠梦境先使用心潮原有的消化与召回。需要 Aru 素材时，以最新可用结构化记忆的原始对话结束时间为终点，取此前 48 小时内结束的全部可用条目，含两个边界。上传时间和当前时间不参与计算。按来源时间从新到旧，每场最多取两条；模型写成的梦落盘时一并保存轮到的位置，到末尾后从头继续。上传、编辑或删除会重新确定候选范围，上次的位置已移出窗口时从最新一条开始。已删除、已归档、禁止浮现、缺失原始对话时间及技术事务类条目会跳过。
+睡眠梦境先使用心潮原有的消化与召回。近期与远期素材都按 OB 当前记录核验，跳过旧梦和已主动遗忘的条目；近期没有合格内容时继续从 Aru 选材。需要 Aru 素材时，以最新可用结构化记忆的原始对话结束时间为终点，取此前 48 小时内结束的全部可用条目，含两个边界。上传时间和当前时间不参与计算。按来源时间从新到旧，每场最多取两条；模型写成的梦落盘时一并保存轮到的位置，到末尾后从头继续。上传、编辑或删除会重新确定候选范围，上次的位置已移出窗口时从最新一条开始。已删除、已归档、禁止浮现、缺失原始对话时间及技术事务类条目会跳过。
 
-上游版本固定为 [心潮念 4.3.0，444e7db2](https://github.com/tianyupaipai-cmd/xinchao-nian/tree/444e7db2d138ad7ff23cafd774a5c0d3eb37aae5)。代码安装目录为 `/opt/xinchao-nian/444e7db2`，网关目录为 `/opt/xinchao-nian/gateway`。集成改动见 `upstream.patch`、`aru-dream.patch`、`aru-dream-window.patch` 和 `restless-wording.patch`。通过 `scripts/prepare-upstream.sh` 可将补丁和六个附加 Python 模块装入上游工作树。补丁也将心潮监听地址设为回环。上游署名和分目录许可见原发行包的 NOTICE 与 docs/LICENSING.md。
+上游版本固定为 [心潮念 4.3.0，444e7db2](https://github.com/tianyupaipai-cmd/xinchao-nian/tree/444e7db2d138ad7ff23cafd774a5c0d3eb37aae5)。代码安装目录为 `/opt/xinchao-nian/444e7db2`，网关目录为 `/opt/xinchao-nian/gateway`。集成改动见 `upstream.patch`、`aru-dream.patch`、`aru-dream-window.patch`、`dream-source-filter.patch` 和 `restless-wording.patch`。通过 `scripts/prepare-upstream.sh` 可将补丁和六个附加 Python 模块装入上游工作树。补丁也将心潮监听地址设为回环。上游署名和分目录许可见原发行包的 NOTICE 与 docs/LICENSING.md。
 
 ## 检查运行情况
 

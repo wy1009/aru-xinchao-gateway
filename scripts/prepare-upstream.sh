@@ -22,10 +22,13 @@ apply_patch_if_needed() {
     fi
 }
 apply_patch_if_needed upstream.patch
-# The window upgrade changes lines introduced by the original dream patch.
-if ! git -C "$target" apply --reverse --check "$repo/aru-dream-window.patch" 2>/dev/null; then
-    apply_patch_if_needed aru-dream.patch
-    apply_patch_if_needed aru-dream-window.patch
+# Each successive dream patch changes lines from the previous one.
+if ! git -C "$target" apply --reverse --check "$repo/dream-source-filter.patch" 2>/dev/null; then
+    if ! git -C "$target" apply --reverse --check "$repo/aru-dream-window.patch" 2>/dev/null; then
+        apply_patch_if_needed aru-dream.patch
+        apply_patch_if_needed aru-dream-window.patch
+    fi
+    apply_patch_if_needed dream-source-filter.patch
 fi
 apply_patch_if_needed restless-wording.patch
 for module in aru_backup aru_backup_ob aru_enrichment aru_source_time aru_wikilinks nian_memory; do

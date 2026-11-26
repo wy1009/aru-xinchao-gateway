@@ -1,0 +1,178 @@
+diff --git a/ombre-brain/src/web/buckets.py b/ombre-brain/src/web/buckets.py
+index 340fa17..06a2934 100644
+--- a/ombre-brain/src/web/buckets.py
++++ b/ombre-brain/src/web/buckets.py
+@@ -125,12 +125,18 @@ def register(mcp) -> None:
+         bucket = await sh.bucket_mgr.get(bucket_id)
+         if not bucket or (bucket.get("metadata") or {}).get("deleted_at"):
+             return JSONResponse({"error": "not found"}, status_code=404)
++        for_dream = request.query_params.get("purpose") == "dream"
++        if for_dream:
++            from aru_backup_ob import eligible_dream_bucket
++            if not eligible_dream_bucket(bucket):
++                return JSONResponse({"error": "not found"}, status_code=404)
+         source = strip_wikilinks(str(bucket.get("content") or ""))
+         all_lines = [line.strip() for line in source.splitlines() if line.strip()]
+         lines = all_lines[:7]
+         return JSONResponse({
+             "id": str(bucket.get("id") or bucket_id),
+             "preview": "\n".join(lines)[:1400],
++            **({"dreamEligible": True} if for_dream else {}),
+             "lineCount": len(lines),
+             "truncated": len(all_lines) > len(lines),
+         })
+diff --git a/xinchao/src/ombre-client.js b/xinchao/src/ombre-client.js
+index 0e07f2c..7622ae7 100644
+--- a/xinchao/src/ombre-client.js
++++ b/xinchao/src/ombre-client.js
+@@ -172,26 +172,18 @@ export class OmbreClient {
+   async digestMaterial(windowHours = 48, { maxChars = 5000, maxBuckets = 8, exclude = DREAM_EXCLUDE_DOMAINS } = {}) {
+     const result = await this.call('dream', { window_hours: windowHours }, 30000);
+     const text = extractText(result);
+-    const blocks = text.split(/\n---\n/).map((b) => b.trim()).filter((b) => /^\[/.test(b));
+-    const picked = [];
+-    for (const block of blocks) {
+-      const head = block.split('\n')[0];
+-      const domains = ((head.match(/主题[:：]\s*([^\s]+)/) || [])[1] || '').split(/[,，]/).filter(Boolean);
+-      if (domains.some((d) => exclude.has(d))) continue;
+-      const id = (block.match(/^ID:\s*([a-f0-9]+)/m) || [])[1] || null;
+-      const va = head.match(/V(-?[\d.]+)\/A(-?[\d.]+)/);
+-      const body = block.split('\n').slice(1).filter((l) => !/^ID:|^👣|^↳/.test(l)).join('\n').trim();
+-      if (!body) continue;
+-      picked.push({ id, domains, valence: va ? Number(va[1]) : null, arousal: va ? Number(va[2]) : null, text: body.slice(0, 900) });
+-      if (picked.length >= maxBuckets) break;
+-    }
+-    let out = '';
+-    for (const item of picked) {
+-      const line = `[domain:${item.domains.join(',')}]${item.valence != null ? ` [情感:V${item.valence}/A${item.arousal}]` : ''}\n${item.text}\n\n`;
+-      if (out.length + line.length > maxChars) break;
+-      out += line;
++    // The first bucket follows the preamble without a separator. Use only IDs
++    // from bucket headers and obtain actual text from the checked OB preview.
++    const headers = [...text.matchAll(/^\[[^\n]*?主题[:：]([^\s]*)[ \t]+V(-?[\d.]+)\/A(-?[\d.]+)[^\n]*\r?\nID:[ \t]*([A-Za-z0-9._-]{1,160})[ \t]*\r?$/gm)];
++    const ids = [], metadata = new Map();
++    for (const [, rawDomains, v, a, id] of headers) {
++      const domains = rawDomains.split(/[,，]/).filter(Boolean);
++      if (domains.some(domain => exclude.has(domain))) continue;
++      ids.push(id);
++      metadata.set(id, { domains, prefix: `[domain:${domains.join(',')}] [情感:V${v}/A${a}]` });
+     }
+-    return { text: out.trim(), bucketIds: picked.map((p) => p.id).filter(Boolean), domains: [...new Set(picked.flatMap((p) => p.domains))], total: blocks.length, kept: picked.length };
++    const material = await this.dreamMaterialForIds(ids, { maxChars, maxBuckets, perBucket: 900, metadata });
++    return { ...material, total: headers.length, kept: material.bucketIds.length };
+   }
+ 
+   async recentAruDreamMaterial(after) {
+@@ -218,7 +210,28 @@ export class OmbreClient {
+     const result = await this.breathAdvanced({
+       mode: 'automatic', max_results: 1, max_tokens: 10000, date_to: dateTo, with_ids: true,
+     });   // 老 OB 没有日期过滤：这一项不给原料（宁可梦里少一头，也不拿最近的事冒充远期）
+-    return materialWithRefs(extractText(result), 1500);
++    return this.dreamMaterialForIds(materialWithRefs(extractText(result), 1500).bucketIds, { maxChars: 1500 });
++  }
++
++  // Rebuild dream input from individual approved documents. Search snippets may
++  // contain unreferenced prose or links to a different (forgotten) document.
++  async dreamMaterialForIds(ids, { maxChars = 10000, maxBuckets = 8, perBucket = 1400, metadata } = {}) {
++    const chunks = [], bucketIds = [], domains = new Set();
++    let remaining = maxChars;
++    for (const id of new Set(ids)) {
++      if (bucketIds.length >= maxBuckets || remaining <= 0) break;
++      const item = await this.memoryBucketPreview(id, 7, 'dream');
++      if (!item.available || !item.preview) continue;
++      const meta = metadata?.get(id);
++      const prefix = (meta?.prefix ?? `[bucket_id:${id}]`) + '\n';
++      const text = item.preview.slice(0, Math.min(perBucket, Math.max(0, remaining - prefix.length)));
++      if (!text.trim()) break;
++      chunks.push(prefix + text);
++      bucketIds.push(id);
++      for (const domain of meta?.domains ?? []) domains.add(domain);
++      remaining -= prefix.length + text.length + 2;
++    }
++    return { text: chunks.join('\n\n'), bucketIds, domains: [...domains] };
+   }
+ 
+   async recentContinuityMaterial(maxTokens = this.config.breathMaxTokens, emotion = null) {
+@@ -300,19 +313,22 @@ export class OmbreClient {
+     return map;
+   }
+ 
+-  async memoryBucketPreview(bucketId, maxLines = 7) {
++  async memoryBucketPreview(bucketId, maxLines = 7, purpose = '') {
+     if (!this.config.readEnabled) return emptyMemoryPreview(bucketId, 'not_configured');
+     const id = String(bucketId ?? '').trim();
+     if (!/^[A-Za-z0-9._-]{1,160}$/.test(id)) return emptyMemoryPreview(id, 'invalid_id');
+     const url = new URL(this.config.url);
+     url.pathname = `/api/bucket-preview/${encodeURIComponent(id)}`;
+     url.search = '';
++    if (purpose === 'dream') url.searchParams.set('purpose', 'dream');
+     const headers = { Accept: 'application/json', 'X-Ombre-Caller': 'dynamic-mind' };
+     if (this.config.token) headers.Authorization = `Bearer ${this.config.token}`;
+     const response = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
+     if (response.status === 404) return emptyMemoryPreview(id, 'not_found');
+     if (!response.ok) throw new Error(`Ombre preview failed: HTTP ${response.status}`);
+-    return parseMemoryPreviewText(JSON.stringify({ ok: true, ...(await response.json()) }), id, maxLines);
++    const data = await response.json();
++    if (purpose === 'dream' && data.dreamEligible !== true) return emptyMemoryPreview(id, 'unverified');
++    return parseMemoryPreviewText(JSON.stringify({ ok: true, ...data }), id, maxLines);
+   }
+ 
+   async memoryBucketPreviews(bucketIds = [], maxLines = 7) {
+diff --git a/xinchao/src/server.js b/xinchao/src/server.js
+index d504b44..95ec814 100644
+--- a/xinchao/src/server.js
++++ b/xinchao/src/server.js
+@@ -361,8 +361,9 @@ async function runCycle() {
+           if (digest.text) { material = digest.text; sourceOmbreBucketIds = digest.bucketIds; relevance.judge('做梦·消化', digest.text); }
+           else {
+             const recalled = await ombre.recentMaterialWithRefs(topDrives(state), emotionForOmbre(state));
+-            sourceOmbreBucketIds = recalled.bucketIds;
+-            material = await materialFromReferencedBuckets(recalled);
++            const eligible = await ombre.dreamMaterialForIds(recalled.bucketIds);
++            sourceOmbreBucketIds = eligible.bucketIds;
++            material = eligible.text;
+             relevance.judge('做梦', material);
+           }
+           log('dream_material', { digestTotal: digest.total, kept: digest.kept, domains: digest.domains.slice(0, 8).join(',') });
+diff --git a/xinchao/test/dream-material-eligibility.test.js b/xinchao/test/dream-material-eligibility.test.js
+new file mode 100644
+index 0000000..1e01f36
+--- /dev/null
++++ b/xinchao/test/dream-material-eligibility.test.js
+@@ -0,0 +1,36 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import { OmbreClient } from '../src/ombre-client.js';
++
++test('dream sources are rebuilt only from verified previews, in rank order', async t => {
++  const client = new OmbreClient({ url: 'http://ob.test/mcp', readEnabled: true });
++  const reads = [];
++  t.mock.method(globalThis, 'fetch', async url => {
++    assert.equal(url.searchParams.get('purpose'), 'dream');
++    const id = url.pathname.split('/').at(-1);
++    reads.push(id);
++    if (id === 'hidden') return new Response(null, {status: 404});
++    // A sidecar from before the upgrade returns a normal, unverified preview.
++    const data = {id, preview: id === 'unverified' ? 'old dream' : 'verified original'};
++    if (id !== 'unverified') data.dreamEligible = true;
++    return Response.json(data);
++  });
++  client.call = async () => ({content:[{type:'text', text:
++    'preamble\n[first] 主题:感情 V0.5/A0.5 创建:x\nID: hidden\nold dream\n---\n' +
++    '[second] 主题: V0.4/A0.3 创建:x\nID: aru_nonhex\ncontaminated snippet\n---\n' +
++    '[third] 主题:亲密 V0.4/A0.3 创建:x\nID: unverified\nlegacy preview'}]});
++  const digest = await client.digestMaterial();
++  assert.equal(digest.total, 3);
++  assert.deepEqual(digest.bucketIds, ['aru_nonhex']);
++  assert.equal(digest.kept, 1);
++  assert.match(digest.text, /verified original/);
++  assert.doesNotMatch(digest.text, /old dream|contaminated|legacy preview/);
++  assert.deepEqual(reads, ['hidden','aru_nonhex','unverified']);
++  const recent = await client.dreamMaterialForIds(['hidden','unverified','aru_nonhex','aru_nonhex']);
++  assert.deepEqual(recent.bucketIds, ['aru_nonhex']);
++  assert.match(recent.text, /verified original/);
++  client.breathAdvanced = async () => ({content:[{type:'text',text:'[bucket_id:hidden]\nold dream'}]});
++  assert.equal((await client.farMaterial()).text, '');
++  assert.equal((await client.dreamMaterialForIds([])).text, '');
++  assert.equal((await client.dreamMaterialForIds(['hidden','unverified'])).text, '');
++});

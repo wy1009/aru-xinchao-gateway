@@ -59,6 +59,16 @@ class SourceTimeSyncTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m["id"] for m in dream_material_page(only, after)["memories"]], ids[:1])
         self.assertEqual(dream_material_page([], after)["memories"], [])
 
+    def test_dream_bucket_eligibility(self):
+        from aru_backup_ob import eligible_dream_bucket
+
+        for meta in ({"dont_surface": True}, {"tags": ["Dream"]}, {"tags": ["梦境"]},
+                     {"source": "xinchao-dream"}, {"type": "archived"}, {"deleted_at": "today"}):
+            self.assertFalse(eligible_dream_bucket({"metadata": meta, "content": "旧素材"}))
+        legacy = {"metadata": {}, "content": "梦境：旧的梦\n梦境余韵：旧余韵"}
+        self.assertFalse(eligible_dream_bucket(legacy))
+        self.assertTrue(eligible_dream_bucket({"metadata": {}, "content": "我们吃饭时聊到了梦。"}))
+
     async def test_dream_candidates_follow_source_conversations_across_imports(self):
         import tempfile
         from aru_backup import OWNER, LABEL

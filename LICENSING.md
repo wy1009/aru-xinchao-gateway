@@ -3,8 +3,8 @@
 | 文件 | 来源与适用条款 |
 | --- | --- |
 | 独立编写的网关、导入工具、通知适配器、测试和部署文件 | AGPL-3.0-only，全文见根目录的 [LICENSE](LICENSE) |
-| `upstream.patch`、`aru-dream.patch`、`aru-dream-window.patch` 和 `restless-wording.patch` 中的 `xinchao/` 修改 | 心潮引擎，沿用 [MIT](licenses/upstream/xinchao/LICENSE) |
-| `upstream.patch` 和 `restless-wording.patch` 中的 `ombre-brain/` 修改 | OB 原始代码沿用 MIT，CyberSealNull 衍生部分仅限个人、学习和非商业使用，商业使用需书面许可。见 [原始 MIT](licenses/upstream/ombre-brain/LICENSE.P0luz-MIT)、[衍生条款](licenses/upstream/ombre-brain/NOTICE.CyberSealNull.md) 和 [上游修改记录](licenses/upstream/ombre-brain/MODIFICATIONS.md) |
+| `upstream.patch`、`aru-dream.patch`、`aru-dream-window.patch`、`dream-source-filter.patch` 和 `restless-wording.patch` 中的 `xinchao/` 修改 | 心潮引擎，沿用 [MIT](licenses/upstream/xinchao/LICENSE) |
+| `upstream.patch`、`dream-source-filter.patch` 和 `restless-wording.patch` 中的 `ombre-brain/` 修改 | OB 原始代码沿用 MIT，CyberSealNull 衍生部分仅限个人、学习和非商业使用，商业使用需书面许可。见 [原始 MIT](licenses/upstream/ombre-brain/LICENSE.P0luz-MIT)、[衍生条款](licenses/upstream/ombre-brain/NOTICE.CyberSealNull.md) 和 [上游修改记录](licenses/upstream/ombre-brain/MODIFICATIONS.md) |
 | `xinchao-now-hook.sh` 和 `aru_wake/runtime/` | xinchao-runtime-bridge，MIT，包含原许可 |
 | `aru_wake/aru/wake-send.mjs` | Aru Host v0.39.2，Apache-2.0，包含原许可 |
 
