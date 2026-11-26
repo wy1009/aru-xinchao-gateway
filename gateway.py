@@ -37,6 +37,7 @@ THINKING_BUDGETS = {
 }
 ANALYSIS = os.environ.get("NIAN_ANALYSIS_URL", CHAT).rstrip("/")
 MIND = os.environ.get("NIAN_MIND_URL", "http://127.0.0.1:18110")
+MIND_ENABLED = os.environ.get("NIAN_MIND_ENABLED", "1") != "0"
 MIND_STATE_MODE = os.environ.get("NIAN_INJECT_MIND_STATE", "1")
 COLLABORATOR = os.environ.get("ARU_COLLABORATOR_NAME", "小禾")
 STATE_HEADING = f"【此刻，{COLLABORATOR}的状态】"
@@ -66,11 +67,11 @@ def load_interaction_prompt():
 
 
 ob_import = load_ob_import()
-INTERACTION_PROMPT = load_interaction_prompt()
+INTERACTION_PROMPT = load_interaction_prompt() if MIND_ENABLED else ""
 SELF_ASSESSMENT_PROMPT = (
     "你现在正在与主人进行怎样的互动？你的情绪是怎样的？请用JSON格式输出，只输出 JSON，前后不包含任何其他字符。\n"
     + INTERACTION_PROMPT[INTERACTION_PROMPT.index("type 只能是"):]
-)
+) if MIND_ENABLED else ""
 EMOTION_CHAR_LIMIT = 8000
 EMOTION_REPLY_RESERVE = 1000
 MEMORY_TARGET_TOKENS = 2 * ob_import._CHUNK_TARGET_TOKENS
@@ -233,6 +234,10 @@ def lineage(messages, index):
 def enqueue(db, turn, session, question, answer, history=None, *, request_body=None):
     if not (question.strip() and answer.strip()):
         return
+    cabin_reply = is_cabin_interaction(question)
+    plan_memory = CHAT_MEMORY_IMPORT and not cabin_reply
+    if not (MIND_ENABLED or plan_memory):
+        return
     group_id, parent_id, anchor = session, None, None
     if history is not None:
         group_id = None
@@ -243,13 +248,11 @@ def enqueue(db, turn, session, question, answer, history=None, *, request_body=N
         if len(matches) == 1:
             parent_id = matches[0]["id"]
         anchor = transcript_hash(prompt, "assistant", answer)
-    cabin_reply = is_cabin_interaction(question)
-    plan_memory = CHAT_MEMORY_IMPORT and not cabin_reply
     if cabin_reply:
         # The cabin already settled the interaction. Only the reply receipt needs delivery.
         question, answer = "", ""
     context = None
-    if request_body is not None and not cabin_reply and not is_bridge_message(question):
+    if MIND_ENABLED and request_body is not None and not cabin_reply and not is_bridge_message(question):
         # Keep the exact outbound prefix while the background assessment is pending.
         fields = ("messages", "tools", "tool_choice", "parallel_tool_calls", "functions", "function_call")
         prefix = {k: request_body[k] for k in fields if k in request_body}
@@ -257,10 +260,16 @@ def enqueue(db, turn, session, question, answer, history=None, *, request_body=N
     with db:
         db.execute(
             "INSERT OR IGNORE INTO turns(id,session,question,answer,group_id,parent_id,anchor,"
-            "memory_planned,memory_check,mode,assessment_context) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "memory_planned,memory_check,mode,assessment_context,mind_done,state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (turn, session, question, answer, group_id, parent_id, anchor,
-             int(not plan_memory), int(plan_memory), "cabin_reply" if cabin_reply else None, context),
+             int(not plan_memory), int(plan_memory), "cabin_reply" if cabin_reply else None, context,
+             int(not MIND_ENABLED), "pending" if MIND_ENABLED else "buffered"),
         )
+
+
+def last_user_index(messages):
+    return next((i for i in range(len(messages) - 1, -1, -1)
+                 if messages[i].get("role") == "user" and not is_aru_environment(messages[i])), None)
 
 
 def turn_identity(request, body, messages):
@@ -272,14 +281,7 @@ def turn_identity(request, body, messages):
         "x-turn-id"
     )
     # Tool continuations include intermediate results. The original user turn is the stable prefix.
-    idx = next(
-        (
-            i
-            for i in range(len(messages) - 1, -1, -1)
-            if messages[i].get("role") == "user" and not is_aru_environment(messages[i])
-        ),
-        None,
-    )
+    idx = last_user_index(messages)
     if idx is None:
         return None
     prefix = [m for m in messages[:idx + 1] if not is_aru_environment(m)]
@@ -435,6 +437,8 @@ class Completion:
         self.tools = False
 
     def accept(self, chunk, streaming):
+        if self.turn is None:
+            return
         for choice in chunk.get("choices") or []:
             if choice.get("index", 0) != 0:
                 continue
@@ -659,7 +663,9 @@ async def chat(req: Request, *, organizer=False):
             raise ValueError
         if body.get("metadata") is not None and not isinstance(body["metadata"], dict):
             raise ValueError
-        turn = None if organizer else turn_identity(req, body, messages)
+        turn = None
+        if not organizer and (MIND_ENABLED or CHAT_MEMORY_IMPORT):
+            turn = turn_identity(req, body, messages)
     except (ValueError, TypeError, KeyError):
         return failure(400, "A valid chat messages array is required.")
     if body.get("model") != MODEL:
@@ -667,13 +673,13 @@ async def chat(req: Request, *, organizer=False):
     apply_siliconflow_effort(body)
     db = req.app.state.db
     state_index = None
-    user_index = turn[2] if turn else None
-    if turn and MIND_STATE_MODE != "0":
+    user_index = turn[2] if turn else last_user_index(messages)
+    if MIND_ENABLED and turn and MIND_STATE_MODE != "0":
         state_index = await add_state(messages, turn, window_key(messages, turn))
         if state_index is not None:
             user_index = state_index + 1
     # Match turns and run bridge hooks on the client input before rewriting the outbound copy.
-    if not organizer:
+    if MIND_ENABLED and not organizer:
         unwrap_selected_wakes(messages)
     completed = OrganizerResult(db, body) if organizer else Completion(db, turn, body)
     client = req.app.state.client
@@ -1239,7 +1245,9 @@ async def lifespan(app):
         timeout=httpx.Timeout(150, connect=12), trust_env=False
     ) as client:
         app.state.client = client
-        tasks = [asyncio.create_task(emotion_worker(app))]
+        tasks = []
+        if MIND_ENABLED:
+            tasks.append(asyncio.create_task(emotion_worker(app)))
         if CHAT_MEMORY_IMPORT:
             tasks.append(asyncio.create_task(memory_worker(app)))
         try:

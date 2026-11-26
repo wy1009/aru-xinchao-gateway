@@ -72,6 +72,32 @@ def spawn(stack, args, env, cwd):
 
 
 class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
+    async def test_mind_disabled_keeps_memory_independent(self):
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.object(gateway, "DB", Path(temp) / "turns.sqlite"),
+            patch.object(gateway, "MIND_ENABLED", False),
+            patch.object(gateway, "emotion_worker", new_callable=AsyncMock) as emotion,
+            patch.object(gateway, "memory_worker", new_callable=AsyncMock) as memory,
+        ):
+            app = SimpleNamespace(state=SimpleNamespace())
+            for enabled in (False, True):
+                with patch.object(gateway, "CHAT_MEMORY_IMPORT", enabled):
+                    async with gateway.lifespan(app):
+                        await asyncio.sleep(0)
+                        db = app.state.db
+                        gateway.enqueue(db, "turn", "room", "问题", "答复", request_body={"messages": []})
+                        row = db.execute("SELECT * FROM turns WHERE id='turn'").fetchone()
+                        if enabled:
+                            memory.assert_awaited_once_with(app)
+                            self.assertEqual((row["state"], row["mind_done"], row["memory_check"]),
+                                             ("buffered", 1, 1))
+                            self.assertIsNone(row["assessment_context"])
+                        else:
+                            memory.assert_not_called()
+                            self.assertIsNone(row)
+            emotion.assert_not_called()
+
     async def test_disabled_chat_memory_skips_backlog_and_new_turns(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "turns.sqlite"

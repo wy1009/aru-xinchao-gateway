@@ -24,6 +24,8 @@ node aru_wake/test.mjs
 
 ## 可选组件
 
+只用网关和 OB 时，在网关环境中设 `NIAN_MIND_ENABLED=0` 并重启网关，再执行 `systemctl disable --now nian-aru-bridge.service nian-mind.service`。网关会跳过心潮心跳、状态注入、小屋回传和情绪自评。聊天转发、用量账本和 Aru 备份导入可独立运行。Leto 也使用 `nian-aru-receipt.socket`，启用 Leto 时应保留该 socket。恢复时先执行 `systemctl enable --now nian-mind.service nian-aru-bridge.service`，再把网关开关设为 `1` 并重启网关。
+
 - **备份上传页**使用 `aru_portal:app`。按 `systemd/aru-backup-*` 的服务路径将 `aru_*.py`、`aru_portal.html`、`wake_import.py` 和 `prompt_audit.py` 放入收件服务目录。创建独立的服务账号及上传密码，`INBOX_DIGEST` 是该密码的 SHA-256 摘要。常驻服务读取 `aru-backup-inbox.env`。在导入服务的 systemd drop-in 中加载含协作者设置的环境文件。导入和 AI 补全服务通过 `LoadCredential=gateway-internal` 取得与 OB 的 `NIAN_INTERNAL_TOKEN` 相同的凭据。反向代理向本机 19148 转发完整的 `/aru-backup` 路径。首次使用可先运行 `aru_backup.py 备份文件` 预览。
 - **手机通知桥**需要已经与手机配对的 Aru Host v0.39.2 和手机导出的发送方 JSON。将 `aru_wake/` 安装到单元指定的目录，再把 `prompt_audit.py` 复制到该目录。发送方配置保存在 `/etc/nian-aru-bridge/sender.json`，仅允许管理员和桥服务账号读取。上传页的 `/aru-backup/xinchao` 是受认证的暂存入口；管理员核对其端点、提交令牌摘要及加密密钥指纹与 Host 登记一致后，将配置安装到上述路径。设置 `ARU_PUBLIC_ORIGIN` 为导出配置中端点的 HTTPS origin（例如 `https://gateway.example.org`），在通知桥和上传页使用同一值。桥使用本机 Host 的 8787 端口。
 - **通过网关使用心潮 MCP** 时，在心潮服务进程的环境中设置 `XINCHAO_MCP_STATE_IN_SYSTEM=1` 并重启心潮。工具直接返回自己的结果，状态由网关按对话窗口加入 system。默认值沿用上游为独立 MCP 客户端提供的工具尾注。
