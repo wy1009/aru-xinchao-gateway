@@ -20,9 +20,37 @@ def headers():
 
 def setup(db):
     with db:
+        db.execute("""CREATE TABLE IF NOT EXISTS paimem_wire_shape(
+            shape TEXT PRIMARY KEY, requests INTEGER NOT NULL DEFAULT 1
+        )""")
         db.execute("""CREATE TABLE IF NOT EXISTS paimem_outbox(
             id TEXT PRIMARY KEY, payload TEXT, attempts INTEGER DEFAULT 0, retry_at REAL DEFAULT 0
         )""")
+
+
+def observe_wire_shape(db, request, body):
+    """Count identifier-field availability. No header values, identifiers or chat text are retained."""
+    metadata = body.get("metadata") or {}
+    names = ("id", "message_id", "messageId", "conversation_id", "conversationId",
+             "userMessageId", "assistantMessageId", "revision", "updatedAt", "deletedAt")
+    flags = {
+        "headers": [k for k in ("x-conversation-id", "x-turn-id", "idempotency-key",
+                                "x-message-id", "x-user-message-id", "x-assistant-message-id")
+                    if request.headers.get(k)],
+        "metadata": [k for k in names if metadata.get(k) is not None],
+        "body": [k for k in names if body.get(k) is not None],
+    }
+    for role in ("user", "assistant"):
+        sample = [m for m in body["messages"][-32:] if m.get("role") == role]
+        flags[role] = {}
+        for k in names:
+            present = sum(m.get(k) is not None for m in sample)
+            if present:
+                flags[role][k] = "all" if present == len(sample) else "some"
+    with db:
+        db.execute("INSERT INTO paimem_wire_shape(shape) VALUES (?) "
+                   "ON CONFLICT(shape) DO UPDATE SET requests=requests+1",
+                   (json.dumps(flags, sort_keys=True),))
 
 
 def queue(db, turn_id, session, question, answer):

@@ -682,6 +682,11 @@ async def chat(req: Request, *, organizer=False):
         return failure(400, f"Select {MODEL}.")
     apply_siliconflow_effort(body)
     db = req.app.state.db
+    if paimem.OWNER and turn and not paimem_event(turn[3]):
+        try:
+            paimem.observe_wire_shape(db, req, body)
+        except sqlite3.Error:
+            log.warning("PaiMem message identifier diagnostics unavailable")
     state_index = None
     user_index = turn[2] if turn else last_user_index(messages)
     if MIND_ENABLED and turn and MIND_STATE_MODE != "0":

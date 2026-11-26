@@ -10,8 +10,9 @@ from pathlib import Path
 
 from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
-from starlette.routing import Route
+from starlette.routing import Mount, Route
 
+from paimem_upload import app as full_archive_upload
 from aru_prompt_log import prompt_log
 from aru_enrich_job import queue
 from aru_inbox import dest, path, pending, receive, saved
@@ -83,6 +84,7 @@ async def lifespan(app):
 from wake_import import wake_import
 
 routes = Starlette(lifespan=lifespan, routes=[
+    Mount(path + "/paimem", app=full_archive_upload),
     Route(path + "/xinchao-log", prompt_log),
     Route(path + "/xinchao", wake_import, methods=["GET","POST"]),
     Route(path, index), Route(path + "/", index), Route(path + "/status", status),

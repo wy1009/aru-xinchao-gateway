@@ -55,3 +55,5 @@ CREATE INDEX IF NOT EXISTS audit_by_time ON audit(at);
 服务单元和参考配置在 `systemd/nian-paimem.service`、`systemd/paimem.env.example`。将对应上游版本放在 `/opt/nian-paimem`，使用独立 Python 3.11 环境运行远程模型配置，服务依赖 FastAPI、httpx、NumPy、portalocker 和 uvicorn。将适配器放入服务工作目录。此配置从既有 `gw-provider.env` 读取硅基流动密钥，并从 systemd 的 `paimem-key` 凭据读取本机服务密钥。
 
 给网关和备份导入器配置相同的 `PAIMEM_OWNER` 及 `LoadCredential=paimem-key:/etc/xinchao-nian/paimem-key`。在备份页面服务设置 `ARU_PAIMEM_SYNC_ENABLED=1`，并将新的备份模块和页面放入原上传服务的应用目录。原 OB 导入 watcher 关闭后，启用 `aru-paimem-import.path`。源备份格式沿用 Polaris v19 的协作者归属和清单校验。上传回执会列出跳过的类别。收到旧快照或某类写入失败时，该快照不会替换当前可召回的记录。
+
+完整备份入口位于原上传站的 `/aru-backup/paimem/`，沿用原站的 Basic 认证。文件按 4 MiB 分块校验和续传，完整包暂存在上传服务私有状态目录的 `paimem-uploads/<清单摘要>/archive.polarisarchive`。此入口用于核对全量原文，不触发旧 OB 同步或自动替换线上索引。网关数据库的 `paimem_wire_shape` 只计数正常聊天请求里已知消息标识字段是否存在，可用于核对客户端实际透传的字段。

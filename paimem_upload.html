@@ -1,0 +1,26 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>顾守 · 上传完整备份</title>
+<style>
+:root{font:16px Inter,"PingFang SC",system-ui,sans-serif;color:#20382d;background:#f5f6f1;color-scheme:light}main{max-width:34rem;margin:12vh auto;padding:0 1.25rem}h1{font-size:2rem}p{line-height:1.7}section{border:1px solid #cdd8cf;border-radius:1rem;background:white;padding:1.5rem}button,input{font:inherit;display:block;margin:1rem 0}button{background:#205b49;color:white;padding:.75rem 1.2rem;border:0;border-radius:.5rem}button:disabled{opacity:.5}progress{width:100%;accent-color:#205b49}
+</style></head><body><main><h1>顾守的完整备份</h1><p>选择 Aru 导出的原始备份。上传中断后，重新选择同一文件即可续传。</p><section><label for="file">Aru 备份文件</label><input id="file" type="file" accept=".polarisarchive,.zip"><button id="send" disabled>上传备份</button><progress hidden id="progress" max="100" value="0"></progress><p id="status" role="status"></p></section></main>
+<script>
+const file=document.querySelector('#file'),button=document.querySelector('#send'),statusText=document.querySelector('#status'),bar=document.querySelector('#progress');
+const base=location.pathname.replace(/\/$/,''), block=4*1024*1024;
+file.onchange=()=>{button.disabled=!file.files.length;statusText.textContent=''};
+async function post(url,body,type){
+ const r=await fetch(base+url,{method:'POST',headers:{'Content-Type':type,'X-Aru-Upload':'1'},body});let d;
+ try{d=await r.json()}catch{throw Error('连接中断，请重新选择同一文件续传。')}
+ if(!r.ok)throw Error(d.message||'传输失败，请重试。');return d
+}
+function progress(label,n,total){bar.value=Math.round(n/total*100);statusText.textContent=label+' '+bar.value+'%'}
+button.onclick=async()=>{
+ const f=file.files[0];if(!f||!f.size)return;
+ file.disabled=true;button.disabled=true;bar.hidden=false;
+ try{const hashes=[];for(let i=0;i<f.size;i+=block){progress('正在核对本地文件',i,f.size);const b=await f.slice(i,i+block).arrayBuffer();
+ const h=await crypto.subtle.digest('SHA-256',b);hashes.push(Array.from(new Uint8Array(h),x=>x.toString(16).padStart(2,'0')).join(''))}
+ let state=await post('/start',JSON.stringify({size:f.size,hashes}),'application/json');const id=state.id;
+ while(state.state!=='received'){const p=state.offset;progress('正在上传',p,f.size);
+ state=await post('/chunk/'+id+'/'+Math.floor(p/block),f.slice(p,p+block),'application/octet-stream');}
+ bar.value=100;statusText.textContent='已完整接收，等待核对。';file.value=''
+ }catch(e){statusText.textContent=e.message||'传输中断，请重试。'}finally{file.disabled=false;button.disabled=!file.files.length}
+};
+</script></body></html>
