@@ -1,0 +1,21 @@
+[Unit]
+Description=PaiMem long-term companion memory
+After=network-online.target
+[Service]
+DynamicUser=yes
+StateDirectory=nian-paimem
+StateDirectoryMode=0700
+WorkingDirectory=/opt/nian-paimem
+LoadCredential=paimem-key:/etc/xinchao-nian/paimem-key
+EnvironmentFile=/etc/xinchao-nian/gw-provider.env
+EnvironmentFile=/etc/xinchao-nian/paimem.env
+ExecStart=/opt/nian-paimem/venv/bin/uvicorn paimem_service:app --host 127.0.0.1 --port 18118 --no-access-log
+Restart=on-failure
+RestartSec=3
+UMask=0077
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+[Install]
+WantedBy=multi-user.target

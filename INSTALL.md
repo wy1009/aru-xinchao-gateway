@@ -47,3 +47,11 @@ CREATE INDEX IF NOT EXISTS audit_by_time ON audit(at);
 2. 创建同名系统用户和组 `leto-wake-bridge`。在仅 root 可读的 `/etc/leto-wake-bridge.env` 中设置 `LETO_MACHINE_TOKEN`、`LETO_BASE_URL=https://leto.sarl` 和与发送方配置一致的 `ARU_PUBLIC_ORIGIN`。桥会在每次投递时读取当前手机绑定。
 3. 将 `aru_wake/leto-wake-bridge.service` 安装到 `/etc/systemd/system/`，将 `aru_wake/leto-aru-bridge.tmpfiles.conf` 安装到 `/etc/tmpfiles.d/`。运行 `systemctl daemon-reload` 和 `systemctl enable --now leto-wake-bridge.service`。单元使用 systemd 254+ 的重启退避。
 4. 在手机 Aru 给对应协作者启用 HTTP MCP `https://leto.sarl/mcp`，请求头为 `Authorization: Bearer <Leto 机器令牌>`。在已加入的 Leto 群里 @ 该协作者即可联测。桥日志里的“已投递”表示手机回了收件回执，实际群回复可在 Leto 查看。
+
+## PaiMem
+
+当前适配的上游为 [PaiMem bbbd1ee](https://github.com/vikotse/PaiMem/tree/bbbd1eed018dd2e2837f17cd160cf5d127ff8d16)。`nian-paimem.service` 在回环地址 `127.0.0.1:18118` 运行官方 API。`paimem_service.py` 适配硅基流动的重排接口，并为 Aru 备份提供原子发布。单用户聊天网关从最近八条普通消息构造查询。检索内容作为历史引文插入当前用户消息前。完整回复进入网关 SQLite 待写队列，写入成功后只保留用于去重的标识。
+
+服务单元和参考配置在 `systemd/nian-paimem.service`、`systemd/paimem.env.example`。将对应上游版本放在 `/opt/nian-paimem`，使用独立 Python 3.11 环境运行远程模型配置，服务依赖 FastAPI、httpx、NumPy、portalocker 和 uvicorn。将适配器放入服务工作目录。此配置从既有 `gw-provider.env` 读取硅基流动密钥，并从 systemd 的 `paimem-key` 凭据读取本机服务密钥。
+
+给网关和备份导入器配置相同的 `PAIMEM_OWNER` 及 `LoadCredential=paimem-key:/etc/xinchao-nian/paimem-key`。在备份页面服务设置 `ARU_PAIMEM_SYNC_ENABLED=1`，并将新的备份模块和页面放入原上传服务的应用目录。原 OB 导入 watcher 关闭后，启用 `aru-paimem-import.path`。源备份格式沿用 Polaris v19 的协作者归属和清单校验。上传回执会列出跳过的类别。收到旧快照或某类写入失败时，该快照不会替换当前可召回的记录。

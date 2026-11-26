@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
+import paimem_gateway as paimem
 from anyio import CancelScope
 from prompt_audit import log_emotion, log_request, log_reply
 from usage_ledger import UsageCall
@@ -172,6 +173,12 @@ def is_aru_environment(message):
 
 def is_external_wake(text):
     return text.startswith(WAKE_PREFIX) and text.endswith(WAKE_SUFFIX)
+
+
+def paimem_event(text):
+    text = text.lstrip()
+    return is_external_wake(text) or text.startswith(
+        (STATE_HEADING, f"【此刻，{COLLABORATOR}的身体状态】", "【心潮】", "【小屋桥·"))
 
 
 def is_cabin_interaction(text):
@@ -428,7 +435,8 @@ async def add_state(messages, turn, scope):
 
 
 class Completion:
-    def __init__(self, db, turn, request_body=None):
+    def __init__(self, db, turn, request_body=None, remember=False):
+        self.remember = remember
         self.db = db
         self.turn = turn
         self.request_body = request_body
@@ -457,6 +465,8 @@ class Completion:
     def save(self):
         if self.turn and self.reason == "stop" and not self.tools:
             tid, session, _, question, history = self.turn
+            if self.remember:
+                paimem.queue(self.db, tid, session, question, "".join(self.text))
             enqueue(self.db, tid, session, question, "".join(self.text), history,
                     request_body=self.request_body)
             self.turn = None  # The terminal delta and [DONE] can both call save().
@@ -664,7 +674,7 @@ async def chat(req: Request, *, organizer=False):
         if body.get("metadata") is not None and not isinstance(body["metadata"], dict):
             raise ValueError
         turn = None
-        if not organizer and (MIND_ENABLED or CHAT_MEMORY_IMPORT):
+        if not organizer and (MIND_ENABLED or CHAT_MEMORY_IMPORT or paimem.OWNER):
             turn = turn_identity(req, body, messages)
     except (ValueError, TypeError, KeyError):
         return failure(400, "A valid chat messages array is required.")
@@ -681,16 +691,43 @@ async def chat(req: Request, *, organizer=False):
     # Match turns and run bridge hooks on the client input before rewriting the outbound copy.
     if MIND_ENABLED and not organizer:
         unwrap_selected_wakes(messages)
-    completed = OrganizerResult(db, body) if organizer else Completion(db, turn, body)
+    remember = bool(paimem.OWNER and turn and not paimem_event(turn[3]))
+    memory = None
+    if remember:
+        context = []
+        for message in reversed(messages[:user_index + 1]):
+            role = message.get("role")
+            if role not in ("user", "assistant") or is_aru_environment(message):
+                continue
+            if message.get("tool_calls") or message.get("function_call"):
+                continue
+            text = as_text(message.get("content")).strip()
+            if text and not (role == "user" and paimem_event(text)):
+                context.append((role, text))
+            if len(context) == 8:
+                break
+        if context and context[0][0] == "user":
+            memory = await paimem.recall(req.app.state.client, list(reversed(context)))
+            if memory:
+                messages.insert(user_index, memory)
+                user_index += 1
+    completed = OrganizerResult(db, body) if organizer else Completion(db, turn, body, remember)
     client = req.app.state.client
     sent_at = time.time()
     try:
-        upstream = await client.send(
-            client.build_request(
-                "POST", CHAT + "/chat/completions", headers=bearer(key), json=body
-            ),
-            stream=True,
-        )
+        async def send_chat():
+            return await client.send(client.build_request(
+                "POST", CHAT + "/chat/completions", headers=bearer(key), json=body), stream=True)
+        upstream = await send_chat()
+        if memory and upstream.status_code in (400, 413, 422):
+            raw_error = (await upstream.aread()).lower()
+            if (upstream.status_code == 413 or any(marker in raw_error for marker in
+                    (b"context_length", b"context length", b"maximum context", b"max_seq_len",
+                     b"max sequence length", b"too many tokens", b"input length"))):
+                await upstream.aclose()
+                messages.pop(user_index - 1)
+                user_index -= 1
+                upstream = await send_chat()
     except httpx.HTTPError:
         if not organizer:
             await asyncio.to_thread(log_request, DB.parent / "prompt-audit", messages,
@@ -1246,6 +1283,9 @@ async def lifespan(app):
     ) as client:
         app.state.client = client
         tasks = []
+        if paimem.OWNER:
+            paimem.setup(db)
+            tasks.append(asyncio.create_task(paimem.deliver(app)))
         if MIND_ENABLED:
             tasks.append(asyncio.create_task(emotion_worker(app)))
         if CHAT_MEMORY_IMPORT:

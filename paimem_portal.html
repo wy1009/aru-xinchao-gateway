@@ -1,0 +1,31 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aru 备份同步</title>
+<style>
+:root{color-scheme:light;font:16px Inter,"PingFang SC",system-ui,sans-serif;color:#253731;background:#f6f6f0}
+main{max-width:36rem;margin:10vh auto;padding:0 1rem}section{padding:1.4rem;border:1px solid #d7dfd6;border-radius:1rem;background:white}
+p{line-height:1.65}input,button{font:inherit;display:block;margin-top:1rem}button{background:#205b49;color:white;border:0;border-radius:.5rem;padding:.75rem 1.1rem}button:disabled{opacity:.55}
+a{color:#205b49}progress{width:100%;margin-top:1rem}
+</style></head><body><main><h1>Aru 备份同步</h1><p>把指定协作者的备份导入 PaiMem，供日常聊天召回。</p>
+<section><label for="file">Aru 备份文件（.polarisarchive）</label><input type="file" id="file" accept=".polarisarchive"><button disabled id="upload">上传并同步</button>
+<progress hidden id="progress" max="100" value="0"></progress><p role="status" id="status"></p><p id="last"></p></section>
+<p><a href="xinchao-log" id="log">网关日志</a></p></main>
+<script>
+const base=location.pathname.replace(/\/$/,''), file=document.querySelector('#file'), upload=document.querySelector('#upload'), statusText=document.querySelector('#status'), last=document.querySelector('#last'), progress=document.querySelector('#progress');
+document.querySelector('#log').href=base+'/xinchao-log';
+let sending=false,busy=false;
+function controls(){upload.disabled=sending||busy||!file.files.length;file.disabled=sending||busy}
+async function refresh(){
+ if(sending)return;
+ try{const r=await fetch(base+'/status',{cache:'no-store'});if(!r.ok)throw Error();const data=await r.json();
+ busy=data.state!=='ready';if(busy)statusText.textContent=data.state==='uploading'?'正在接收备份。':'正在写入 PaiMem，可以稍后回来查看。';
+ else if(statusText.dataset.busy==='true')statusText.textContent='';
+ statusText.dataset.busy=String(busy);const receipt=data.last;
+ if(receipt){const at=new Date(receipt.at).toLocaleString('zh-CN',{hour12:false});const c=receipt.changes;
+ last.textContent=receipt.ok?at+' 已同步。新增 '+c.create+'，移除旧版本 '+c.archive+'，未变 '+c.unchanged+'。'+(receipt.skipped||[]).join('、'):at+' '+receipt.message}
+ controls()}catch{if(!sending)statusText.textContent='暂时无法读取进度，请刷新重试。'}}
+file.onchange=controls;
+upload.onclick=()=>{const f=file.files[0];if(!f||sending||busy)return;sending=true;controls();progress.hidden=false;
+ const xhr=new XMLHttpRequest();xhr.open('POST',base+'/upload');xhr.setRequestHeader('Content-Type','application/octet-stream');xhr.setRequestHeader('X-Aru-Upload','1');
+ xhr.upload.onprogress=e=>{if(e.lengthComputable)progress.value=100*e.loaded/e.total};
+ xhr.onloadend=()=>{sending=false;progress.hidden=true;if(xhr.status===201){file.value='';statusText.textContent='上传完成。'}else{statusText.textContent='上传未完成，请重试。'}controls();refresh()};xhr.send(f)};
+refresh();setInterval(()=>{if(!document.hidden)refresh()},3500);
+</script></body></html>
