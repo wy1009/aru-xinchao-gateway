@@ -12,6 +12,28 @@ from aru_portal_worker import process
 
 
 class PortalTest(unittest.TestCase):
+    def test_ob_pause_blocks_writes_and_preserves_shared_routes(self):
+        with tempfile.TemporaryDirectory() as work, patch.dict(os.environ, {
+            "INBOX_PATH": "/aru-backup", "STATE_DIRECTORY": work, "ARU_OB_SYNC_ENABLED": "0",
+            "INBOX_DIGEST": hashlib.sha256(b"test-password").hexdigest(),
+        }):
+            import aru_inbox
+            import aru_portal
+            importlib.reload(aru_inbox)
+            importlib.reload(aru_portal)
+            auth = ("aru", "test-password")
+            path = "/aru-backup"
+            headers = {"Content-Type": "application/octet-stream", "X-Aru-Upload": "1"}
+            with TestClient(aru_portal.app) as client:
+                for suffix in ("", "/", "/status"):
+                    self.assertEqual(client.get(path + suffix, auth=auth).status_code, 503)
+                for suffix in ("/upload", "/enrich"):
+                    self.assertEqual(client.post(path + suffix, headers=headers).status_code, 401)
+                    self.assertEqual(client.post(path + suffix, auth=auth, headers=headers,
+                                                 content=b"backup").status_code, 503)
+                self.assertEqual(client.get(path + "/xinchao", auth=auth).status_code, 200)
+            self.assertEqual(list(Path(work).iterdir()), [])
+
     def test_repeated_uploads_and_restart(self):
         with tempfile.TemporaryDirectory() as work:
             folder = Path(work)

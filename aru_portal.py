@@ -19,6 +19,8 @@ from aru_inbox import dest, path, pending, receive, saved
 NO_CACHE = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
 PAGE = Path(__file__).with_name("aru_portal.html").read_text()
 PASSWORD_DIGEST = os.environ["INBOX_DIGEST"]
+OB_SYNC_ENABLED = os.environ.get("ARU_OB_SYNC_ENABLED", "1") != "0"
+OB_SYNC_PATHS = {path, path + "/status", path + "/upload", path + "/enrich"}
 
 
 def authorized(header):
@@ -95,5 +97,9 @@ async def app(scope, receive_body, send):
             response = PlainTextResponse("请使用上传专用账号登录。", status_code=401, headers={
                 **NO_CACHE, "WWW-Authenticate": 'Basic realm="Aru Backup", charset="UTF-8"',
             })
+            return await response(scope, receive_body, send)
+        if not OB_SYNC_ENABLED and scope["path"].rstrip("/") in OB_SYNC_PATHS:
+            response = PlainTextResponse("OB 已停用，备份同步和记忆补全已暂停。",
+                                         status_code=503, headers=NO_CACHE)
             return await response(scope, receive_body, send)
     return await routes(scope, receive_body, send)
