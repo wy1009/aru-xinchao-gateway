@@ -1,0 +1,7 @@
+[Unit]
+Description=Watch for a completed Aru snapshot
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+[Install]
+WantedBy=timers.target

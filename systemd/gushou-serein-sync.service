@@ -1,0 +1,12 @@
+[Unit]
+Description=Reconcile Gushou Serein with the latest completed Aru archive
+After=gushou-serein.service
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/opt/gushou-serein/venv/bin/python /opt/gushou-serein/aru_serein_sync.py
+ExecStartPost=/usr/bin/systemctl --no-block start gushou-serein-upload-resume.service
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/gushou-serein

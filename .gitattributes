@@ -3,3 +3,4 @@ aru-dream.patch -text -whitespace
 aru-dream-window.patch -text -whitespace
 restless-wording.patch -text -whitespace
 dream-source-filter.patch -text -whitespace
+scripts/serein-*.patch -text -whitespace

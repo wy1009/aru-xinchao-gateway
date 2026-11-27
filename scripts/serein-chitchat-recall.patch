@@ -1,0 +1,11 @@
+--- a/recall/routing.py
++++ b/recall/routing.py
+@@ -67,4 +67,8 @@
+             best = max(boundaries)
+             if best >= policy["boundary_veto_min_score"] and max(0, winner["score"]-best) <= policy["boundary_veto_max_deficit"]:
+                 return {**result, "reason": "recall_boundary", "boundary_score": best}
++    # Gushou's ordinary chat should reach candidate retrieval and reranking.
++    # Keep the route label and scores available in the hook diagnostics.
++    if winner["name"] in {"present_chitchat", "present_reality", "intimate_contact", "技术闲聊"}:
++        return {**result, "action": "recall", "reason": "companion_chat_recall"}
+     return {**result, "action": "skip", "reason": "published_skip_route"}

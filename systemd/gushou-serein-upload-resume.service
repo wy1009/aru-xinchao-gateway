@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume Serein event generation after a replacement transcript upload
+ConditionPathExists=/var/lib/gushou-serein/.awaiting-transcript-upload
+ConditionPathExists=!/etc/gushou-serein/.codex-curation
+After=gushou-serein-sync.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/xinchao-nian/gw-provider.env
+ExecStart=/usr/bin/python3 /opt/gushou-serein/aru-serein-resume-after-upload.py
+UMask=0077

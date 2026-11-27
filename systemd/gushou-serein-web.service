@@ -1,0 +1,33 @@
+[Unit]
+Description=Serein management UI for Gushou
+After=network.target gushou-serein.service
+
+[Service]
+User=serein-web
+Group=serein-web
+WorkingDirectory=/opt/gushou-serein/web
+LoadCredential=memory-token:/etc/gushou-serein/hook-key
+LoadCredential=aru-login:/etc/xinchao-nian/aru-backup-inbox.env
+Environment=SEREIN_MEMORY_TOKEN_FILE=%d/memory-token
+Environment=SEREIN_WEB_AUTH_FILE=%d/aru-login
+Environment=SEREIN_MEMORY_URL=http://127.0.0.1:18118
+EnvironmentFile=/etc/gushou-serein/web.env
+Environment=SEREIN_BASE_PATH=/__serein/
+Environment=SEREIN_GATEWAY_BIND=127.0.0.1
+Environment=SEREIN_GATEWAY_PORT=18217
+Environment=SEREIN_PREVIEW_PORT=18218
+Environment=SEREIN_ROUTE_DRAFT_FILE=/var/lib/serein-web/semantic-route-draft.json
+StateDirectory=serein-web
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/node server/gateway.mjs
+Restart=on-failure
+RestartSec=3
+UMask=0077
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/opt/gushou-serein/web/node_modules/.vite-temp
+
+[Install]
+WantedBy=multi-user.target

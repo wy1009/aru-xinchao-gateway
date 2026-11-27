@@ -1,0 +1,216 @@
+--- a/src/pages/MemoryPage.jsx
++++ b/src/pages/MemoryPage.jsx
+@@ -28,7 +28,6 @@
+ import { canonicalDomainPolicies } from "../data/basement.js";
+ import {
+   loadMemorySnapshot,
+-  readMemoryScenes,
+   storeMemoryScenes,
+   tombstoneMemoryScenes,
+ } from "../storage/memoryStore.js";
+@@ -92,48 +91,12 @@
+ }
+ 
+ const memoryTypeLabels = { scene: "Scene", event: "事件", fact: "事实", preference: "喜好" };
+-const factEventCacheKey = "serein.memory.fact-events.v2";
+-const factEventCacheMaxAgeMs = 5 * 60 * 1000;
+ let factEventListLoadInFlight = null;
+-
+-function factEventSummary(item) {
+-  if (!item || typeof item !== "object") return null;
+-  const { source_refs: _sourceRefs, ...summary } = item;
+-  return summary.item_id ? summary : null;
+-}
+ 
+ function factEventSourceCount(item) {
+   if (Array.isArray(item?.source_refs)) return item.source_refs.length;
+   const count = Number(item?.source_count);
+   return Number.isFinite(count) && count >= 0 ? count : 0;
+-}
+-
+-function readFactEventCache() {
+-  try {
+-    const payload = JSON.parse(window.localStorage.getItem(factEventCacheKey));
+-    if (!payload || !Array.isArray(payload.fact) || !Array.isArray(payload.event)) return null;
+-    return {
+-      cachedAt: Number(payload.cachedAt) || 0,
+-      items: {
+-        fact: payload.fact.map(factEventSummary).filter(Boolean),
+-        event: payload.event.map(factEventSummary).filter(Boolean),
+-      },
+-    };
+-  } catch {
+-    return null;
+-  }
+-}
+-
+-function storeFactEventCache(items) {
+-  try {
+-    window.localStorage.setItem(factEventCacheKey, JSON.stringify({
+-      cachedAt: Date.now(),
+-      fact: items.fact.map(factEventSummary).filter(Boolean),
+-      event: items.event.map(factEventSummary).filter(Boolean),
+-    }));
+-  } catch {
+-    // Live reads remain available when browser storage is full or disabled.
+-  }
+ }
+ 
+ async function requestFactEvents({ type, status, query = "", includeSources = false, signal }) {
+@@ -480,8 +443,7 @@
+       setSceneRecords(updated);storeMemoryScenes(updated);setSceneActionState("success");setSceneActionMessage("已移除关联，记忆正文保留。");
+     } catch {setSceneActionState("error");setSceneActionMessage("关联未完整移除，请刷新后重试。");}
+   }
+-  const initialFactEventCache = useMemo(readFactEventCache, []);
+-  const [sceneRecords, setSceneRecords] = useState(readMemoryScenes);
++  const [sceneRecords, setSceneRecords] = useState([]);
+   const [memoryType, setMemoryType] = useState(() => window.location.hash === "#preferences" ? "preference" : "scene");
+   useEffect(() => {
+     const sync = () => setMemoryType(current => window.location.hash === "#preferences"
+@@ -495,9 +457,9 @@
+   const acceptFavorite=(id,favorite)=>setFavoriteIds(current=>{
+     const next=new Set(current);if(favorite)next.add(id);else next.delete(id);return next;
+   });
+-  const [factEvents, setFactEvents] = useState(initialFactEventCache?.items || { fact: [], event: [] });
++  const [factEvents, setFactEvents] = useState({ fact: [], event: [] });
+   const [factEventDetails, setFactEventDetails] = useState({});
+-  const [factEventLoadState, setFactEventLoadState] = useState(initialFactEventCache ? "ready" : "loading");
++  const [factEventLoadState, setFactEventLoadState] = useState("loading");
+   const [factEventError, setFactEventError] = useState("");
+   const [factEventSearch, setFactEventSearch] = useState({
+     type: "",
+@@ -546,19 +508,16 @@
+   },[memoryType]);
+ 
+   useEffect(() => {
+-    storeMemoryScenes(sceneRecords);
+-  }, [sceneRecords]);
+-
+-  useEffect(() => {
+-    let cancelled = false;
+-    loadMemorySnapshot().then((snapshotScenes) => {
+-      if (cancelled || !snapshotScenes?.length) return;
+-      setSceneRecords(snapshotScenes);
+-      setSelectedSceneId(null);
+-    });
+-    return () => {
+-      cancelled = true;
++    let active = true;
++    const refresh = async () => {
++      const scenes = await loadMemorySnapshot();
++      if (!active || !Array.isArray(scenes)) return;
++      setSceneRecords(scenes);
++      setSelectedSceneId(current => scenes.some(scene => scene.id === current) ? current : null);
+     };
++    refresh();
++    window.addEventListener("focus", refresh);
++    return () => { active = false; window.removeEventListener("focus", refresh); };
+   }, []);
+ 
+   useEffect(() => {
+@@ -606,29 +565,25 @@
+   useEffect(() => {
+     let cancelled = false;
+     const load = async () => {
+-      const cacheIsFresh = initialFactEventCache
+-        && Date.now() - initialFactEventCache.cachedAt < factEventCacheMaxAgeMs;
+-      if (cacheIsFresh) return;
+-      if (!initialFactEventCache) setFactEventLoadState("loading");
+       setFactEventError("");
+       try {
+         const nextItems = await loadFactEventLists();
+         if (!cancelled) {
+           setFactEvents(nextItems);
+-          storeFactEventCache(nextItems);
++          setFactEventDetails({});
+           setFactEventLoadState("ready");
+         }
+       } catch (error) {
+         if (!cancelled) {
+-          if (!initialFactEventCache) setFactEventLoadState("error");
+-          else setFactEventLoadState("ready");
+-          setFactEventError(initialFactEventCache ? "" : (error.message || "暂时没有读到事实和事件。"));
++          setFactEventLoadState("error");
++          setFactEventError(error.message || "暂时没有读到事实和事件。");
+         }
+       }
+     };
+     load();
+-    return () => { cancelled = true; };
+-  }, [initialFactEventCache]);
++    window.addEventListener("focus", load);
++    return () => { cancelled = true; window.removeEventListener("focus", load); };
++  }, []);
+ 
+   useEffect(() => {
+     const openFromRecall = (event) => {
+@@ -1008,7 +963,6 @@
+         .filter((item) => item.item_id !== previousId && item.item_id !== revisedItem.item_id)
+         .concat(revisedItem),
+       };
+-      storeFactEventCache(next);
+       return next;
+     });
+     setFactEventDetails((current) => ({ ...current, [revisedItem.item_id]: revisedItem }));
+@@ -1023,7 +977,6 @@
+         .filter((item) => item.item_id !== previousId)
+         .concat(updatedItem),
+       };
+-      storeFactEventCache(next);
+       return next;
+     });
+     setSelectedFactEventId(null);
+@@ -1036,7 +989,6 @@
+         ...current,
+         [itemType]: current[itemType].filter((item) => !deleted.has(item.item_id)),
+       };
+-      storeFactEventCache(next);
+       return next;
+     });
+     setSelectedFactEventId(null);
+@@ -1066,7 +1018,6 @@
+       });
+       setFactEvents(current => {
+         const next = { ...current, event: applyEventBatch(current.event, result.receipts, true) };
+-        storeFactEventCache(next);
+         return next;
+       });
+       setFactEventSearch(current => current.type === "event"
+--- a/src/storage/memoryStore.js
++++ b/src/storage/memoryStore.js
+@@ -1,9 +1,7 @@
+ import { initializePersonal } from "./personalStore.js";
+ const memoryScenesStorageKey = "serein.memory.scene-records.v1";
+ const retiredMemorySnapshotStorageKey = "serein.memory.snapshot.v1";
+-const memoryLiveCacheAtStorageKey = "serein.memory.live-cache-at.v1";
+ const memorySceneTombstonesStorageKey = "serein.memory.scene-tombstones.v1";
+-const memoryLiveCacheMaxAgeMs = 5 * 60 * 1000;
+ let memorySnapshotLoadInFlight = null;
+ 
+ function splitParagraphs(content) {
+@@ -217,13 +215,10 @@
+ async function loadMemorySnapshotOnce() {
+   try { await initializePersonal(); } catch { return null; } // Leave the old browser records intact until import succeeds.
+   try {
+-    const cachedAt = Number(window.localStorage.getItem(memoryLiveCacheAtStorageKey) || 0);
+-    const cachedScenes = readMemoryScenes();
+-    if (cachedScenes.length && Date.now() - cachedAt < memoryLiveCacheMaxAgeMs) return cachedScenes;
+-  } catch {
+-    // Continue to the live projection when cache metadata is unavailable.
+-  }
+-
++    window.localStorage.removeItem("serein.memory.fact-events.v2");
++    window.localStorage.removeItem("serein.memory.live-cache-at.v1");
++    window.localStorage.removeItem(retiredMemorySnapshotStorageKey);
++  } catch { /* Live reads also work when storage is disabled. */ }
+   let liveProjection = null;
+   try {
+     const liveResponse = await fetch("/__serein/live/memory-scenes", {
+@@ -291,7 +286,6 @@
+     if (!scenes.length && liveProjection.scenes.length) return null;
+ 
+     storeMemoryScenes(scenes);
+-    window.localStorage.setItem(memoryLiveCacheAtStorageKey, String(Date.now()));
+     return scenes;
+   } catch {
+     return null;

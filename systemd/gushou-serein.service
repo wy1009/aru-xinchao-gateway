@@ -1,0 +1,22 @@
+[Unit]
+Description=Serein memory for Gushou
+After=network-online.target
+[Service]
+User=gushou-serein
+Group=gushou-serein
+WorkingDirectory=/var/lib/gushou-serein
+EnvironmentFile=/etc/xinchao-nian/gw-provider.env
+Environment=PYTHONUNBUFFERED=1
+Environment=SEREIN_HTTP_TOKEN_FILE=%d/hook-key
+LoadCredential=hook-key:/etc/gushou-serein/hook-key
+ExecStart=/opt/gushou-serein/venv/bin/python -m serein.launch --config /etc/gushou-serein/config.toml http --live --host 127.0.0.1 --port 18118
+Restart=on-failure
+RestartSec=3
+UMask=0077
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/gushou-serein
+[Install]
+WantedBy=multi-user.target

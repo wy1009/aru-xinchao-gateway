@@ -12,6 +12,33 @@ from aru_portal_worker import process
 
 
 class PortalTest(unittest.TestCase):
+    def test_compact_log_separates_injection_and_limits_closed_messages(self):
+        from aru_prompt_log import compact_log
+        from serein_gateway import inject
+        from prompt_audit import request_messages
+
+        messages = [{"role": "system", "content": "private setup"}]
+        messages.extend({"role": "user", "content": f"old-{i}!"} for i in range(13))
+        messages.append({"role": "user", "content": [{"type": "text", "text": "question"}]})
+        index = len(messages) - 1
+        entries = request_messages(inject(messages, "note <tag>", index), index, None)
+        entries.append([None, "assistant", "本轮模型回复 · stop", "answer"])
+        rows = [(str(i), 10 + i, "200") for i in range(10)]
+        with patch("aru_prompt_log.page_records", side_effect=[rows, (10, "200", entries)]) as records:
+            response = compact_log(None)
+            self.assertEqual(records.call_args_list[0].kwargs["limit"], 10)
+        html = response.body.decode()
+        self.assertEqual(html.count("<details>"), 10)
+        self.assertNotIn("<details open", html)
+        self.assertNotIn("private setup", html)
+        self.assertNotIn("old-4!", html)
+        self.assertIn("old-5!", html)
+        self.assertEqual(html.count("note &lt;tag&gt;"), 1)
+        self.assertIn("question", html)
+        self.assertIn("answer", html)
+        with patch("aru_prompt_log.page_records", return_value=rows):
+            self.assertEqual(compact_log("too-old").status_code, 404)
+
     def test_ob_pause_blocks_writes_and_preserves_shared_routes(self):
         with tempfile.TemporaryDirectory() as work, patch.dict(os.environ, {
             "INBOX_PATH": "/aru-backup", "STATE_DIRECTORY": work, "ARU_OB_SYNC_ENABLED": "0",

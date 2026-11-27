@@ -1,0 +1,20 @@
+[Unit]
+Description=Gushou current-original evidence adapter
+After=gushou-serein.service
+[Service]
+User=gushou-serein
+Group=gushou-serein
+WorkingDirectory=/opt/gushou-serein
+EnvironmentFile=/etc/xinchao-nian/gw-provider.env
+LoadCredential=hook-key:/etc/gushou-serein/hook-key
+ExecStart=/opt/gushou-serein/venv/bin/python -m uvicorn aru_serein_bridge:app --host 127.0.0.1 --port 18119 --no-access-log
+Restart=on-failure
+RestartSec=2
+UMask=0077
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+ReadWritePaths=/var/lib/gushou-serein
+NoNewPrivileges=true
+[Install]
+WantedBy=multi-user.target

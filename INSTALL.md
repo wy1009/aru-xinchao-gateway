@@ -51,3 +51,33 @@ CREATE INDEX IF NOT EXISTS audit_by_time ON audit(at);
 ## Aru 完整备份
 
 在上传服务的应用目录部署 `aru_archive_upload.py` 和 `aru_archive_upload.html`。访问 `/aru-backup/archive/`，使用原站的 Aru 认证上传完整备份。页面支持 4 MiB 分块校验和续传，文件保存在该服务私有状态目录的 `archive-uploads/<清单摘要>/archive.polarisarchive` 中，等待核对。
+
+## 顾守的 Serein 试用实例
+
+Serein 上游仓库为 `https://github.com/Yinglianchun/Serein`，使用提交 `fdab5a8af8c966572c47faabed18223079bc91c4`。
+`nian-gateway` 从 `serein_gateway.py` 调用本机的 `gushou-serein`（18118）和
+`gushou-serein-bridge`（18119）。`systemd/95-serein.conf` 在顾守的网关上启用接入。
+两个服务的内部认证使用 systemd 凭据，Aru 客户端和备份页沿用现有认证。
+
+在服务器的 `/etc/gushou-serein/web.env` 设置 `SEREIN_PUBLIC_ORIGIN=https://你的域名`。管理后台的「记忆」页在该站点的 `/__serein/#memory`，与备份页共用 Aru 登录。
+官方 Web 前端以 `SEREIN_BASE_PATH=/__serein/` 构建。将 `aru_serein_web_auth.mjs` 放入 Web 的 `server/` 目录，把 `server/gateway.mjs` 中 `requireWebAuth` 的导入路径从 `./webAuth.mjs` 改为 `./aru_serein_web_auth.mjs`，即可沿用备份页的认证。Caddy 将 `/__serein/*` 原样转给
+`gushou-serein-web.service`（本机 18217）。备份密码更换时一并重启该服务，以重新加载凭据。
+
+顾守以手动上传的完整 `.polarisarchive` 为原话来源。`gushou-serein-sync.timer` 检查已完成的上传，按会话和备份消息 ID 校正新增、修改、删除及排除，只导入顾守获准会话的聊天原文。服务器上的 `/etc/gushou-serein/.backup-only` 使桥接服务拒绝实时原话，启用备份校正。网关设置 `NIAN_SEREIN_LIVE_CAPTURE=0`，普通聊天仍可召回已整理的事件。
+
+原话正文被确认改写后，下一轮会针对新版重新归线、判断和撰写事件，即便先前曾跳过该句、当前只有一条待处理的用户消息。整理器会看到修订消息的编号和当前有效的相邻原话。修订原因只采用双方在对话里明确说过的内容。首次导入某条备份消息时，若 Aru 的修订记录能证实存在不同的已完成正文，也会触发复核。已处理的消息重复上传相同正文时沿用现有结果。可在队列 `status` 的 `pending_edit_reviews` 查看待复核的原话数量。
+
+云端 Codex 每天北京时间 03:00 和 15:00 核对最新完整备份。只有发现新包，才领取 `/opt/gushou-serein/serein-agent-queue.py` 中的备份归线、切分和事件写作任务；成功完成后，在 `background_state.aru_codex_finished_snapshot_v1` 记录该包的时间与上传标识，失败保留给下次重试。`/etc/gushou-serein/.codex-curation` 标记保留 Codex 整理方式。管理页「记忆 → 事件」可以查看结果并展开来源原文。「沉淀」使用 Serein 自己的 Event 到 Scene 流程。
+
+实例专属的事件写作约定可以保存在服务器的 `/etc/gushou-serein/writer-wording.txt`（UTF-8）。整理器优先使用这份文件，未配置时使用内置写作规则。
+
+每次聊天只用主人刚发的这一条消息查询一次 Serein Hook，检索时去掉客户端附加的发送时间。网关按 Hook 的排序注入通过来源校验的记忆卡。每张卡最多附一轮已核对的完整历史原话，以「主人」「顾守」标记。近期已显示的完整对话和多张卡共用的同一轮原话会去重。
+
+本实例在 Serein 包目录以 `-p1` 应用 `scripts/serein-chitchat-recall.patch`。闲聊、当下情境、亲近和技术闲聊四类消息继续参与候选检索与重排。升级 Serein 时需核对此处路由。登录 `/aru-backup/xinchao-log?feed=recall` 可查看最近十次请求的实际记忆注入，每次最多显示十条聊天消息，正文默认折叠。
+
+服务状态可在服务器上查看。
+
+```sh
+systemctl status nian-gateway gushou-serein gushou-serein-bridge gushou-serein-sync.timer gushou-serein-web
+journalctl -u gushou-serein-sync.service -n 12
+```

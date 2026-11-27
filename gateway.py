@@ -19,6 +19,7 @@ import httpx
 from anyio import CancelScope
 from prompt_audit import log_emotion, log_request, log_reply
 from usage_ledger import UsageCall
+import serein_gateway as serein
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -432,6 +433,7 @@ class Completion:
         self.db = db
         self.turn = turn
         self.request_body = request_body
+        self.serein_record = None
         self.text = []
         self.reason = None
         self.tools = False
@@ -457,6 +459,8 @@ class Completion:
     def save(self):
         if self.turn and self.reason == "stop" and not self.tools:
             tid, session, _, question, history = self.turn
+            if self.serein_record:
+                serein.queue(self.db,self.serein_record,"".join(self.text))
             enqueue(self.db, tid, session, question, "".join(self.text), history,
                     request_body=self.request_body)
             self.turn = None  # The terminal delta and [DONE] can both call save().
@@ -663,8 +667,15 @@ async def chat(req: Request, *, organizer=False):
             raise ValueError
         if body.get("metadata") is not None and not isinstance(body["metadata"], dict):
             raise ValueError
+        changes = {}
+        if serein.ENABLED and serein.LIVE_CAPTURE and not organizer:
+            changes = serein.source_changes(messages, body.get("metadata"), as_text)
+            if changes["deleted"]:
+                deleted = set(changes["deleted"])
+                messages = [m for m in messages if serein.message_id(m) not in deleted]
+                body = {**body, "messages": messages}
         turn = None
-        if not organizer and (MIND_ENABLED or CHAT_MEMORY_IMPORT):
+        if not organizer and (MIND_ENABLED or CHAT_MEMORY_IMPORT or serein.ENABLED):
             turn = turn_identity(req, body, messages)
     except (ValueError, TypeError, KeyError):
         return failure(400, "A valid chat messages array is required.")
@@ -674,6 +685,8 @@ async def chat(req: Request, *, organizer=False):
     db = req.app.state.db
     state_index = None
     user_index = turn[2] if turn else last_user_index(messages)
+    recent = serein.window(messages, user_index, as_text) if serein.ENABLED and turn else []
+    source_window = serein.source_window(messages, user_index, as_text) if recent and serein.LIVE_CAPTURE else []
     if MIND_ENABLED and turn and MIND_STATE_MODE != "0":
         state_index = await add_state(messages, turn, window_key(messages, turn))
         if state_index is not None:
@@ -683,6 +696,21 @@ async def chat(req: Request, *, organizer=False):
         unwrap_selected_wakes(messages)
     completed = OrganizerResult(db, body) if organizer else Completion(db, turn, body)
     client = req.app.state.client
+    recall_status = "本轮未发起检索"
+    if recent:
+        original_ready = True
+        if serein.LIVE_CAPTURE:
+            completed.serein_record = {"turn":turn[0],"session":turn[1],"turns":recent,"stamp":int(time.time()*1000),
+                                       "source_changes":changes,"source_window":source_window}
+            original_ready = await serein.received(client,db,completed.serein_record)
+        if original_ready:
+            memories, recall_status = await serein.recall(client, recent, turn[1])
+            if memories:
+                messages = serein.inject(messages, memories, user_index)
+                body = {**body, "messages": messages}
+        else:
+            recall_status = "原话待确认，本轮未检索"
+    audit_suffix = " · Serein " + recall_status if serein.ENABLED else ""
     sent_at = time.time()
     try:
         upstream = await client.send(
@@ -694,13 +722,13 @@ async def chat(req: Request, *, organizer=False):
     except httpx.HTTPError:
         if not organizer:
             await asyncio.to_thread(log_request, DB.parent / "prompt-audit", messages,
-                                    user_index, state_index, sent_at, "上游连接异常，接收未确认")
+                                    user_index, state_index, sent_at, "上游连接异常，接收未确认" + audit_suffix)
         return failure(502, "The chat provider is unavailable.")
     audit = None
     if not organizer:
         directory = DB.parent / "prompt-audit"
         record_id = await asyncio.to_thread(log_request, directory, messages, user_index,
-                                            state_index, sent_at, f"模型服务 HTTP {upstream.status_code}")
+                                            state_index, sent_at, f"模型服务 HTTP {upstream.status_code}" + audit_suffix)
         if record_id and upstream.is_success:
             audit = ReplyAudit(directory, record_id)
     meter = UsageCall(DB.parent / "prompt-audit", "organizer" if organizer else "chat",
@@ -1246,6 +1274,9 @@ async def lifespan(app):
     ) as client:
         app.state.client = client
         tasks = []
+        if serein.ENABLED and serein.LIVE_CAPTURE:
+            serein.setup(db)
+            tasks.append(asyncio.create_task(serein.worker(app)))
         if MIND_ENABLED:
             tasks.append(asyncio.create_task(emotion_worker(app)))
         if CHAT_MEMORY_IMPORT:
