@@ -1,0 +1,15 @@
+[Unit]
+Description=Compare MCP service directories with the Aru gateway catalog
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/leto-wake-bridge.env
+EnvironmentFile=-/etc/xiaohongshu-mcp.env
+ExecStart=/opt/xinchao-nian/venv/bin/python -B /opt/xinchao-nian/gateway/aru_mcp_catalog_check.py
+TimeoutStartSec=180
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+UMask=0077

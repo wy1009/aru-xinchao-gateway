@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the MCP catalog every six hours
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:00:00 Asia/Shanghai
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
