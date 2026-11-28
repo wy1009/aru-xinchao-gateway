@@ -54,12 +54,34 @@ class MCPArguments(unittest.IsolatedAsyncioTestCase):
                     args(alias('search_library'), dsml('query','') ),
                     bad.replace('"arguments":', '"arguments":{}, "arguments":'),
                     bad.replace('"arguments":', '"extra":1,"arguments":')):
-            self.assertIsNone(adapter.corrected_arguments(raw))
+            self.assertIsNone(adapter.corrected_arguments(raw, {alias('writeInformationCard'): {'required': ['subject', 'content']}}))
         for name, finish in [('invokeMCPTool', 'length'), ('other', 'tool_calls')]:
             fn = call(name, bad)
             self.assertFalse(adapter.repair([{'choices':[{'message':{'tool_calls':[fn]},
                                                          'finish_reason':finish}]}], 'message'))
             self.assertEqual(fn['function']['arguments'], bad)
+
+    def test_proactive_prefix_on_other_tools_and_typed_fields(self):
+        target = alias('calendar_lookup')
+        inner = ('  <｜DSML｜parameter name="query" string="true">a < b & c</｜DSML｜parameter>\n'
+                 '<｜DSML｜parameter name="limit" string="false">12</｜DSML｜parameter>'
+                 '<｜DSML｜parameter name="opts" string="false">{"more":false}')
+        expected = {'query': 'a < b & c', 'limit': 12, 'opts': {'more': False}}
+        for text in (inner, inner.replace('｜', '|')):
+            with self.subTest(text=text):
+                wire = adapter.corrected_arguments(args(target, text))
+                self.assertEqual(json.loads(wire), {'tool': target, 'arguments': expected})
+        outer = (dsml('tool', target) + '</｜DSML｜parameter>' +
+                 '<｜DSML｜parameter name="arguments" string="false">{"limit":2}')
+        self.assertEqual(json.loads(adapter.corrected_arguments(outer))['arguments'], {'limit': 2})
+
+    def test_recognizes_only_the_object_slot_and_preserves_literal_text(self):
+        target = alias('calendar_lookup')
+        example = dsml('query', 'abc')
+        for value in ({'query': example}, 'example: ' + example, example + '</｜DSML｜par',
+                      example + '</｜DSML｜parameter>' + dsml('query', 'again'),
+                      '<｜DSML｜parameter name="limit" string="false">true or false'):
+            self.assertIsNone(adapter.corrected_arguments(args(target, value)))
 
     async def test_fragmented_interleaved_sse_keeps_call_ids_usage_and_choices(self):
         tool = alias('search_library')

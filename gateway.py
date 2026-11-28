@@ -35,6 +35,7 @@ MODEL = os.environ.get("NIAN_MODEL", V32)
 CHAT_MODEL = os.environ.get("NIAN_CHAT_MODEL", MODEL)
 CLIENT_MODEL_SELECTION = os.environ.get("NIAN_CLIENT_MODEL_SELECTION") == "1"
 MCP_CATALOG = aru_native_tools.load(os.environ.get("NIAN_ARU_MCP_CATALOG"))
+MCP_SCHEMAS = {t["alias"]: t["function"]["parameters"] for server in MCP_CATALOG for t in server["tools"]}
 ANALYSIS_MODEL = os.environ.get("NIAN_ANALYSIS_MODEL", MODEL)
 CHAT = os.environ.get("NIAN_CHAT_URL", "https://api.siliconflow.cn/v1").rstrip("/")
 THINKING_BUDGETS = {
@@ -588,16 +589,14 @@ class OrganizerResult(VisibleChoices):
             )
 
 
-async def relay(upstream, completed, audit=None, meter=None, *, fix_mcp=False, choices=1, projected=None):
+async def relay(upstream, completed, audit=None, meter=None, *, fix_mcp=False, projected=None):
     # OpenAI SSE events are UTF-8. Preserve their fields, including usage and tool-call deltas.
     data = []
     done = False
     try:
         lines = upstream.aiter_lines()
-        if fix_mcp:
-            lines = aru_mcp_arguments.stream_lines(lines, choices)
-        if projected:
-            lines = aru_native_tools.stream_lines(lines, projected)
+        if projected or fix_mcp:
+            lines = aru_native_tools.stream_lines(lines, projected or {}, MCP_SCHEMAS if fix_mcp else None)
         async for line in lines:
             if line.startswith("data:"):
                 data.append(line[5:].lstrip(" "))
@@ -791,13 +790,12 @@ async def chat(req: Request, *, organizer=False):
             audit = ReplyAudit(directory, record_id)
     meter = UsageCall(DB.parent / "prompt-audit", "organizer" if organizer else "chat",
                       CHAT, upstream_model, body.get("n") or 1) if upstream.is_success else None
-    fix_mcp = (not organizer and upstream_model in V32_MODELS
-               and aru_mcp_arguments.advertised(body))
+    fix_mcp = not organizer and aru_mcp_arguments.advertised(body)
     if upstream.is_success and upstream.headers.get("content-type", "").startswith(
         "text/event-stream"
     ):
         return StreamingResponse(
-            relay(upstream, completed, audit, meter, fix_mcp=fix_mcp, choices=body.get("n") or 1, projected=projected),
+            relay(upstream, completed, audit, meter, fix_mcp=fix_mcp, projected=projected),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
@@ -805,7 +803,7 @@ async def chat(req: Request, *, organizer=False):
         raw = await upstream.aread()
         if upstream.is_success:
             chunk = json.loads(raw)
-            repaired = fix_mcp and aru_mcp_arguments.repair([chunk], "message")
+            repaired = fix_mcp and aru_mcp_arguments.repair([chunk], "message", MCP_SCHEMAS)
             translated = projected and aru_native_tools.restore(chunk, projected)
             if repaired or translated:
                 raw = json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode()

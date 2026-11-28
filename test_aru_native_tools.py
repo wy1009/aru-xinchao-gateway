@@ -99,6 +99,33 @@ class NativeTools(unittest.TestCase):
             self.assertEqual(json.loads(native.wrapped(tool,raw)),{"tool":tool["alias"], "arguments":expected})
         self.assertIsNone(json.loads(native.wrapped(self.listing, "{}", complete=False))["arguments"])
 
+    def test_completed_tagged_arguments_are_restored_before_forwarding(self):
+        projected = {self.search["function"]["name"]: self.search}
+        tag = '<｜DSML｜parameter name="query" string="true">天气'
+        expected = {"tool": self.search["alias"], "arguments": {"query": "天气"}}
+        for raw in (tag, json.dumps(tag), json.dumps({"query": tag})):
+            tc = call("serein_search", raw, "A")
+            result = {"choices": [{"message": {"tool_calls": [tc]}, "finish_reason": "tool_calls"}]}
+            native.restore(result, projected)
+            recovered = json.loads(tc["function"]["arguments"])
+            self.assertEqual(recovered, expected if raw != json.dumps({"query":tag})
+                             else {**expected,"arguments":{"query":tag}})
+            self.assertEqual(tc["id"], "A")
+
+        stream = native.StreamCalls(projected, {self.search["alias"]: self.search["function"]["parameters"]})
+        raw_wrapper = native.wire({"tool":self.search["alias"], "arguments":tag})
+        def feed(delta, finish=None):
+            chunk = {"choices":[{"delta":delta, "finish_reason":finish}]}
+            stream.apply(chunk)
+            return delta.get("tool_calls", [])
+        original = feed({"tool_calls":[{"id":"A","index":0,"function":{"name":"serein_search","arguments":tag[:4]}},
+                                        {"id":"B","index":1,"function":{"name":native.DISPATCH,"arguments":raw_wrapper[:8]}}]})
+        self.assertEqual([i["id"] for i in original], ["A","B"])
+        feed({"tool_calls":[{"index":0,"function":{"arguments":tag[4:]}},
+                            {"index":1,"function":{"arguments":raw_wrapper[8:]}}]})
+        completed = feed({}, "tool_calls")
+        self.assertEqual([json.loads(i["function"]["arguments"]) for i in completed], [expected, expected])
+
     def test_stream_fragmented_parallel_mixed_and_long_arguments(self):
         _, m = self.project()
         stream=native.StreamCalls(m)

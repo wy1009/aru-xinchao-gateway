@@ -3,6 +3,8 @@ import json
 import re
 from pathlib import Path
 
+import aru_mcp_arguments as dsml
+
 DISPATCH = "invokeMCPTool"
 NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 HANDLE = re.compile(r"mcp__[A-Za-z0-9_-]+__[A-Fa-f0-9]{32}")
@@ -207,6 +209,12 @@ def provider_history(messages, projected):
 
 def wrapped(tool, raw, complete=True):
     args = parse(raw)
+    if complete and not isinstance(args, dict):
+        recovered = dsml.recover_parameters(args if isinstance(args, str) else raw,
+                                            tool["alias"], tool["function"]["parameters"])
+        if recovered is not None:
+            args = recovered
+            dsml.log.info("MCP DSML parameters restored: projected function")
     if complete and (raw is None or isinstance(raw, str) and not raw.strip()) and not tool["function"]["parameters"].get("required"):
         args = {}
     # Malformed or truncated calls must fail the client's object validation.
@@ -227,9 +235,13 @@ def restore(chunk, projected):
 
 
 class StreamCalls:
-    """Hold only projected call arguments until a complete object can be safely wrapped."""
-    def __init__(self, projected):
+    """Assemble MCP arguments per choice and call; let ordinary text and other tools stream."""
+    def __init__(self, projected, dispatcher_schemas=None):
         self.tools = projected
+        self.dispatcher_schemas = dispatcher_schemas
+        self.names = set(projected)
+        if dispatcher_schemas is not None:
+            self.names.add(DISPATCH)
         self.calls = {}
 
     def apply(self, chunk):
@@ -241,11 +253,7 @@ class StreamCalls:
                 continue
             reason = choice.get("finish_reason")
             current = {}
-            for pos, call in enumerate(delta.get("tool_calls") or ()):
-                n = call.get("index", pos)
-                fn = call.get("function")
-                if not isinstance(fn, dict):
-                    continue
+            for n, fn in dsml.functions_in_choice(choice, "delta"):
                 current[n] = fn
                 state = self.calls.setdefault((idx, n), {"name": "", "args": [], "mode": "pending"})
                 if state["mode"] == "passthrough":
@@ -258,10 +266,10 @@ class StreamCalls:
                     state["args"].append(args)
                 if state["mode"] == "pending":
                     name = state["name"]
-                    if name in self.tools and (args or reason or not any(s != name and s.startswith(name) for s in self.tools)):
+                    if name in self.names and (args or reason or not any(s != name and s.startswith(name) for s in self.names)):
                         state["mode"] = "projected"
                         fn["name"] = DISPATCH
-                    elif not any(s.startswith(name) for s in self.tools):
+                    elif not any(s.startswith(name) for s in self.names):
                         state["mode"] = "passthrough"
                         if old_name or len(state["args"]) > (args is not None):
                             fn.update(name=name, arguments="".join(state["args"]))
@@ -283,21 +291,29 @@ class StreamCalls:
                     fn = current.get(n)
                     if fn is None:
                         fn = {}
-                        delta.setdefault("tool_calls", []).append({"index": n, "function": fn})
+                        if n == -1:
+                            delta["function_call"] = fn
+                        else:
+                            delta.setdefault("tool_calls", []).append({"index": n, "function": fn})
                     name = state["name"]
                     args = "".join(state["args"])
-                    if name in self.tools:
+                    if name in self.names:
                         if state["mode"] == "pending":
                             fn["name"] = DISPATCH
-                        fn["arguments"] = wrapped(self.tools[name], args, reason in ("stop", "tool_calls"))
+                        complete = reason in ("stop", "tool_calls", "function_call")
+                        if name == DISPATCH:
+                            repaired = dsml.corrected_arguments(args, self.dispatcher_schemas) if complete else None
+                            fn["arguments"] = repaired if repaired is not None else args
+                        else:
+                            fn["arguments"] = wrapped(self.tools[name], args, complete)
                     else:
                         fn.update(name=name, arguments=args)
                     changed = True
         return changed
 
 
-async def stream_lines(lines, projected):
-    adapter = StreamCalls(projected)
+async def stream_lines(lines, projected, dispatcher_schemas=None):
+    adapter = StreamCalls(projected, dispatcher_schemas)
     frame = []
     async for line in lines:
         if line:
@@ -309,7 +325,8 @@ async def stream_lines(lines, projected):
             # Send completed arguments before the finish marker, as native Aru tools do.
             before_finish = []
             for choice in chunk.get("choices") or ():
-                if choice.get("finish_reason") and (choice.get("delta") or {}).get("tool_calls"):
+                delta = choice.get("delta") or {}
+                if choice.get("finish_reason") and (delta.get("tool_calls") or delta.get("function_call")):
                     before_finish.append({**choice, "finish_reason": None})
                     choice["delta"] = {}
             if before_finish:

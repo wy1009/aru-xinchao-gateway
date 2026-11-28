@@ -124,12 +124,11 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                     response.raise_for_status()
                     self.assertEqual(sent[-1]["model"],selected or pro)
                     arguments = json.loads(response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])
+                    self.assertEqual(arguments["arguments"],{})
                     if selected != extra:
                         self.assertEqual(sent[-1]["thinking_budget"],1024)
-                        self.assertEqual(arguments["arguments"],{})
                     else:
                         self.assertNotIn("thinking_budget",sent[-1])
-                        self.assertIsInstance(arguments["arguments"],str)
                 self.assertEqual((await phone.post("/aru-memory/v1/chat/completions",
                                                   json={**payload,"model":pro})).status_code,400)
                 with sqlite3.connect(path.parent/"prompt-audit"/"usage.sqlite") as usage:
