@@ -12,6 +12,7 @@ from threading import Lock
 from .store import CATEGORIES, catalog, connect, passages, read, sources
 
 KINDS = (*CATEGORIES, '事件', '原文')
+STRONG_RELEVANCE = 0.5
 _index_locks = {True: Lock(), False: Lock()}
 log = logging.getLogger(__name__)
 
@@ -173,7 +174,7 @@ def search(settings, query, *, kinds=KINDS, limit=10, automatic=False):
     if not automatic and len(kinds)>1 and scores:
         leaders = {}
         for k in order:
-            if scores[k] >= 0.5:
+            if scores[k] >= STRONG_RELEVANCE:
                 leaders.setdefault(corpus[k][0], k)
         head = set(leaders.values())
         order = list(leaders.values()) + [k for k in order if k not in head]
@@ -186,7 +187,7 @@ def search(settings, query, *, kinds=KINDS, limit=10, automatic=False):
         if k not in current or current[k] != corpus[k] or identifier in seen:
             continue
         kind,title,body = current[k]
-        if automatic and (not scores or scores[k] < 0.5):
+        if automatic and (not scores or scores[k] < STRONG_RELEVANCE):
             continue
         item = {'id':identifier,'kind':kind,'title':title,'passage':body,'part':n+1,
                 'matched_by':pool[k]['via'],'relevance':scores.get(k)}

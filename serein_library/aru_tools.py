@@ -1,4 +1,5 @@
 """Aru-shaped MCP operations for authored Serein materials."""
+import json
 import re
 from typing import Annotated, Any
 
@@ -45,37 +46,90 @@ def edit_target(handle, expected_kind):
     return match[1], int(match[3])
 
 
+def read_history(path, identifier):
+    from serein.compat.originals import raw_id
+    from serein.core.reader import Reader
+
+    kind, _, key = identifier.partition(':')
+    unavailable = '这条来源已撤下或不可读，请重新搜索。'
+    if kind in ('raw', 'aru'):
+        with store.connect(path) as db:
+            if kind == 'raw':
+                rows = store.original_rows(db, number=raw_id(identifier))
+            else:
+                session, sep, mid = key.partition(':')
+                if not sep or not session or not mid:
+                    raise store.SourceUnavailable(unavailable)
+                rows = store.original_rows(db, message=(session, mid))
+            row = next(rows, None)
+            if row is None:
+                raise store.SourceUnavailable(unavailable)
+            return store.original_document(row)
+
+    # Resolve the native revision, bindings, visibility and source text in one snapshot.
+    with Reader(path) as reader, reader.store.transaction():
+        result = reader.read(identifier, kind=kind, with_evidence=True)
+        doc = result.get('document')
+        if (not result['readable'] or not result.get('surface_state', {}).get('can_surface')
+                or doc['metadata'].get('aru_import')):
+            raise store.SourceUnavailable(unavailable)
+        originals = {}
+        for binding in result['evidence']:
+            try:
+                coords = json.loads(binding['source_key'])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(coords, list) or len(coords) != 3 or coords[0] != 'aru':
+                continue  # Only verified chat originals belong in the evidence list.
+            row = next(store.original_rows(reader.store.conn, message=coords[1:]), None)
+            if row is None or row['text'] != binding['content']:
+                raise store.SourceUnavailable(unavailable)
+            originals[(row['stamp'], row['session'], row['seq'], row['id'])] = store.original_document(row)
+        return {'id': identifier, 'kind': '事件' if kind == 'event' else '场景',
+                'title': doc['title'], 'content': doc['body_md'], 'revision': doc['revision'],
+                'evidence': [originals[k] for k in sorted(originals)]}
+
+
+def open_source(path, identifier, *, page=None, query=None):
+    revision = None
+    if identifier.startswith(('raw:', 'aru:', 'event:', 'scene:')):
+        doc = read_history(path, identifier)
+    else:
+        doc = store.read(path, resolve_read_id(path, identifier))
+        doc.pop('imported_summary', None)
+        revision = doc.pop('revision')
+    body = doc['content']
+    total = max(1, (len(body) + PAGE_CHARS - 1) // PAGE_CHARS)
+    if query:
+        pages = set()
+        pos = body.find(query)
+        while pos >= 0:
+            pages.add(pos // PAGE_CHARS + 1)
+            pos = body.find(query, pos + 1)
+        doc['matchedPages'] = sorted(pages)
+    if page is not None:
+        if page > total:
+            raise ValueError(f'这份资料共 {total} 页，请使用有效页码')
+        doc.update(page=page, totalPages=total, content=body[(page - 1) * PAGE_CHARS : page * PAGE_CHARS])
+        if total > 1:
+            doc['nextPage'] = page + 1 if page < total else None
+            if revision is not None:
+                doc['editHint'] = '要更新这份资料，请仅传 id 读回全文和更新标识。'
+            return doc
+    if revision is not None:
+        handle_field = 'cardId' if doc['kind'] == '信息卡' else 'reference'
+        doc[handle_field] = f"{doc['id']}@{revision}"
+    return doc
+
+
 def register_aru_tools(server, settings):
     from mcp.types import ToolAnnotations
     path = settings.database
 
     def openMemorySource(id: str, page: Annotated[int, Field(ge=1)] | None = None,
                          query: str | None = None) -> dict[str, Any]:
-        """读 Serein 信息卡或长期资料。只传目录中的 id 即可读全文，返回的 cardId 或 reference 可直接用于更新。长期资料也可指定页码从 1 开始读；query 可定位原文所在页。"""
-        doc = store.read(path, resolve_read_id(path, id))
-        # The writable summary is distinct from the historical import provenance.
-        doc.pop('imported_summary', None)
-        revision = doc.pop('revision')
-        body = doc['content']
-        total = max(1, (len(body) + PAGE_CHARS - 1) // PAGE_CHARS)
-        if query:
-            pages = set()
-            pos = body.find(query)
-            while pos >= 0:
-                pages.add(pos // PAGE_CHARS + 1)
-                pos = body.find(query, pos + 1)
-            doc['matchedPages'] = sorted(pages)
-        if page is not None:
-            if page > total:
-                raise ValueError(f'这份资料共 {total} 页，请使用有效页码')
-            doc.update(page=page, totalPages=total, content=body[(page - 1) * PAGE_CHARS : page * PAGE_CHARS])
-            if total > 1:
-                doc['nextPage'] = page + 1 if page < total else None
-                doc['editHint'] = '要更新这份资料，请仅传 id 读回全文和更新标识。'
-                return doc
-        handle_field = 'cardId' if doc['kind'] == '信息卡' else 'reference'
-        doc[handle_field] = f"{doc['id']}@{revision}"
-        return doc
+        """打开任一 search_library 结果或资料目录项。直接传返回的 id 即可。事件或场景同时返回正文和当前绑定的备份原话 evidence；聊天原文带说话人和日期。信息卡和长期资料读全文后可沿用 cardId 或 reference 更新。page 从 1 开始；query 按原文字面定位页码。"""
+        return open_source(path, id, page=page, query=query)
 
     def writeInformationCard(subject: str, content: str, cardId: str | None = None) -> dict[str, Any]:
         """在 Serein 保存信息卡。新建传 subject（主题）和 content（完整正文）。补写旧卡先读全文，将原有内容和改动合在 content 里，并原样带回 cardId。"""

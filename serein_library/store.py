@@ -2,7 +2,9 @@ import hashlib
 import sqlite3
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 CATEGORIES = ("信息卡", "长期资料")
 SCHEMA = """
@@ -20,6 +22,10 @@ CREATE TABLE IF NOT EXISTS companion_search_vector(
  id TEXT NOT NULL, stamp TEXT NOT NULL, profile TEXT NOT NULL, part INTEGER NOT NULL,
  embedding BLOB NOT NULL, PRIMARY KEY(id,stamp,profile,part));
 """
+
+class SourceUnavailable(ValueError):
+    """The selected source is missing, withdrawn or no longer readable."""
+
 
 @contextmanager
 def connect(path, *, write=False):
@@ -58,7 +64,7 @@ def read(path, identifier):
             FROM companion_material m LEFT JOIN companion_material_summary s ON s.id=m.id
             LEFT JOIN companion_material_origin o ON o.id=m.id WHERE m.id=?""",(identifier,)).fetchone()
         if row is None:
-            raise ValueError("资料 ID 不存在，请重新查看目录")
+            raise SourceUnavailable("资料 ID 不存在，请重新查看目录")
         result = dict(row)
         if result['kind'] != '长期资料':
             result.pop('summary')
@@ -150,27 +156,46 @@ def passages(body, size=1000):
         start = end
 
 
+def original_rows(db, *, number=None, message=None):
+    """Current backup originals shared by search, direct reads and bound evidence."""
+    from serein.compat.originals import READABLE
+    from serein.compat.germany.raw_events import strip_raw_client_context
+
+    sql = """SELECT r.id,r.role,r.text,r.event_hash,r.created_at,o.text AS exported,
+                    o.stamp,o.session,o.seq FROM
+        (SELECT * FROM raw_events WHERE source='aru' AND """ + READABLE + """) r
+        JOIN aru_scope a ON a.session=r.session_id AND a.allowed=1
+        JOIN aru_original o ON o.source=r.source AND o.session=r.session_id AND o.mid=r.source_event_id
+            AND o.role=r.role"""
+    params = ()
+    if number is not None:
+        sql += ' WHERE r.id=?'
+        params = (number,)
+    elif message is not None:
+        sql += ' WHERE r.session_id=? AND r.source_event_id=?'
+        params = message
+    for row in db.execute(sql + ' ORDER BY r.id', params):
+        if row['text'] == row['exported'] or row['text'] == strip_raw_client_context(row['exported']):
+            yield row
+
+
+def original_document(row):
+    speaker = '主人' if row['role'] == 'user' else '顾守'
+    # This database stores Aru timestamps with an explicit offset.
+    stamp = datetime.fromisoformat(row['created_at'].replace('Z','+00:00')).astimezone(ZoneInfo('Asia/Shanghai'))
+    return {'id': 'raw:' + str(row['id']), 'kind': '原文', 'speaker': speaker,
+            'date': stamp.isoformat(), 'title': f'{speaker} · {stamp:%Y-%m-%d %H:%M}', 'content': row['text']}
+
+
 def sources(db, kinds):
     if set(kinds) & set(CATEGORIES):
         for row in db.execute('SELECT id,kind,title,content,revision FROM companion_material ORDER BY id'):
             if row['kind'] in kinds:
                 yield (row['id'], row['kind'], row['title'], row['content'], str(row['revision']))
     if '原文' in kinds:
-        from serein.compat.originals import READABLE
-        from serein.compat.germany.raw_events import strip_raw_client_context
-        rows = db.execute("""SELECT r.id,r.role,r.text,r.event_hash,r.created_at,o.text AS exported FROM
-            (SELECT * FROM raw_events WHERE source='aru' AND """ + READABLE + """) r
-            JOIN aru_scope a ON a.session=r.session_id AND a.allowed=1
-            JOIN aru_original o ON o.source=r.source AND o.session=r.session_id AND o.mid=r.source_event_id
-            AND o.role=r.role ORDER BY r.id""")
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        for r in rows:
-            if r['text'] != r['exported'] and r['text'] != strip_raw_client_context(r['exported']):
-                continue
-            speaker = '主人' if r['role'] == 'user' else '顾守'
-            stamp = datetime.fromisoformat(r['created_at'].replace('Z','+00:00')).astimezone(ZoneInfo('Asia/Shanghai'))
-            yield ('raw:'+str(r['id']), '原文', f'{speaker} · {stamp:%Y-%m-%d %H:%M}', r['text'], r['event_hash'])
+        for row in original_rows(db):
+            doc = original_document(row)
+            yield (doc['id'], '原文', doc['title'], doc['content'], row['event_hash'])
     if '事件' in kinds:
         from serein.core.store import Store
         # Delegate visibility (e.g. covered or promoted Events) to Serein's canonical rules.

@@ -147,6 +147,84 @@ class Materials(unittest.TestCase):
         self.assertEqual(store.read(self.db, imported)['imported_summary'], '迁入的摘要')
         self.assertEqual(call('openMemorySource', id=imported)['summary'], '')
 
+    def test_search_hits_have_one_open_action_and_expand_current_evidence(self):
+        from serein.core.store import Store, encode
+        self.settings.database = Path(self.folder.name) / 'native.db'
+        path = self.settings.database
+        with Store(path) as native:
+            db = native.conn
+            db.executescript("""
+                CREATE TABLE raw_events(id INTEGER PRIMARY KEY,source,session_id,source_event_id,role,
+                    text,event_hash,created_at,metadata_json);
+                CREATE TABLE aru_scope(session PRIMARY KEY, allowed);
+                CREATE TABLE aru_original(source,session,mid,role,text,stamp,seq);
+                INSERT INTO aru_scope VALUES('window',1);
+            """)
+            native.create('one', 'event', '旧花园', '花园里种薄荷。')
+            native.create('two', 'scene', '花园日记', '花园里下雨了。')
+            for number, role, body in [(2, 'assistant', '花园种薄荷。'), (1, 'user', '花园种什么？')]:
+                mid = str(number)
+                db.execute('INSERT INTO raw_events VALUES(?,?,?,?,?,?,?,?,?)',
+                           (number, 'aru', 'window', mid, role, body, mid, '2025-01-01T00:00:00Z', '{}'))
+                db.execute('INSERT INTO aru_original VALUES(?,?,?,?,?,?,?)',
+                           ('aru', 'window', mid, role, body, number, number))
+                src = native.add_source(encode(['aru', 'window', mid]), body)
+                native.bind('one', src)
+        store.setup(path)
+        card = store.create(path, '信息卡', '花园卡', '花园信息')
+        ref = store.create(path, '长期资料', '花园书', '花园资料')
+        server = self.material_server()
+
+        def call(tool, **args):
+            return asyncio.run(server.call_tool(tool, args))[1]
+
+        class Embed:
+            dimension = 1
+            def documents(self, texts):
+                return [[1.] for _ in texts]
+            def query(self, text):
+                return {'embedding': [1.]}
+
+        def rerank(query, docs):
+            return {item['ref']: .95 if item['ref'][0] == 'event:one' else .7 for item in docs}
+
+        with patch.object(search, 'models', return_value=('test', Embed(), rerank)):
+            hits = call('search_library', query='花园')['items']
+            self.assertEqual({h['id'] for h in hits}, {'event:one', 'scene:two', 'raw:1', 'raw:2', card, ref})
+            self.assertEqual([h['id'] for h in hits if 'opened' in h], ['event:one'])
+            for hit in hits:
+                action = hit['open']
+                self.assertEqual(action, {'name':'openMemorySource', 'arguments':{'id':hit['id']}})
+                doc = call(action['name'], **action['arguments'])
+                self.assertIn(hit['passage'], doc['content'])
+                if 'opened' in hit:
+                    self.assertEqual(doc, hit['opened'])
+                    self.assertEqual([(x['id'], x['speaker'], x['content']) for x in doc['evidence']],
+                                     [('raw:1', '主人', '花园种什么？'), ('raw:2', '顾守', '花园种薄荷。')])
+            self.assertEqual(call('openMemorySource', id='aru:window:1'), call('openMemorySource', id='raw:1'))
+            self.assertEqual(call('openMemorySource', id='scene:two')['evidence'], [])
+            with store.connect(path, write=True) as db:
+                db.execute("UPDATE aru_original SET text='改过的原话' WHERE mid='1'")
+            for ident in ('event:one', 'raw:1'):
+                with self.assertRaisesRegex(Exception, '重新搜索'):
+                    call('openMemorySource', id=ident)
+            self.assertNotIn('event:one', {h['id'] for h in call('search_library', query='花园')['items']})
+            with store.connect(path, write=True) as db:
+                db.execute('UPDATE aru_scope SET allowed=0')
+            with self.assertRaisesRegex(Exception, '重新搜索'):
+                call('openMemorySource', id='raw:2')
+            with Store(path) as native:
+                native.set_lifecycle('two', 'archived')
+            with self.assertRaisesRegex(Exception, '重新搜索'):
+                call('openMemorySource', id='scene:two')
+
+        with patch.object(search, 'models', return_value=('test', Embed(), lambda q, docs: {
+                d['ref']: .1 for d in docs})):
+            hits = call('search_library', query='花园', kind='信息卡')['items']
+            self.assertEqual(len(hits), 1)
+            self.assertIn('open', hits[0])
+            self.assertNotIn('opened', hits[0])
+
     def test_index_only_uses_current_text_and_injects_at_document_granularity(self):
         class Embed:
             dimension = 2
