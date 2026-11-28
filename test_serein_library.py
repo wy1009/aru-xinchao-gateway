@@ -128,6 +128,12 @@ class Materials(unittest.TestCase):
         with self.assertRaisesRegex(Exception, '未唯一'):
             call('openMemorySource', id='card:12345678')
 
+        opaque = 'mem_9876543210abcdef9876543210ab'
+        card = store.create(self.db, '信息卡', '迁入的卡', '现行卡片', source_id='aru-card-' + opaque)
+        self.assertEqual(call('openMemorySource', id='memory_event:' + opaque)['id'], card)
+        with self.assertRaisesRegex(Exception, '未唯一'):
+            call('openMemorySource', id='memory_event:' + opaque.upper())
+
         imported = store.create(self.db, '长期资料', '从前写的', '原文', source_id='aru-reference-' + uid)
         with store.connect(self.db, write=True) as db:
             db.executescript("""

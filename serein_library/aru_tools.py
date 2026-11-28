@@ -18,8 +18,11 @@ def resolve_read_id(path, identifier):
         return handle[1]
     prefix, _, value = identifier.partition(':')
     source_prefix = {'memory_event': 'aru-card-', 'memory_reference_doc': 'aru-reference-'}.get(prefix)
-    if source_prefix and re.fullmatch(ARU_UUID, value, re.I):
-        sql = 'SELECT id FROM companion_material WHERE source_id=? COLLATE NOCASE'
+    if source_prefix and value:
+        # UUID spelling varies across Aru exports. Newer card IDs are opaque.
+        sql = 'SELECT id FROM companion_material WHERE source_id=?'
+        if re.fullmatch(ARU_UUID, value, re.I):
+            sql += ' COLLATE NOCASE'
         params = (source_prefix + value,)
     elif prefix == 'card' and re.fullmatch(r'[0-9a-f]{8}', value, re.I):
         sql = 'SELECT id FROM companion_material WHERE substr(source_id,1,?)=? COLLATE NOCASE'
