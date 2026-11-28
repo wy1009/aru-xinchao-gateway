@@ -151,6 +151,129 @@ class NativeTools(unittest.TestCase):
         self.assertEqual(out["tool_choice"]["allowed_tools"], {"mode":"required","tools":[allowed["allowed_tools"]["tools"][1]]})
         self.assertNotIn(native.DISPATCH, json.dumps(out))
 
+    def test_excluded_history_and_rejected_attempts_preserve_other_calls(self):
+        error = json.dumps({"error": {"code": "invokeMCPTool.invalid_arguments"}, "status": "error"})
+        # Empty args with an excluded receipt and malformed args with a confirmed
+        # rejection are the two shapes Aru sent in the affected conversation.
+        block = [{"role": "assistant", "content": "我先查一下。", "tool_calls": [
+            call(native.DISPATCH, "{}", "excluded"), call(native.DISPATCH, '{"function":"guess"}', "bad"),
+            call("local", "{}", "good")]},
+            {"role": "tool", "tool_call_id": "good", "content": "ok"},
+            {"role": "tool", "tool_call_id": "excluded", "content": native.EXCLUDED_RESULT},
+            {"role": "tool", "tool_call_id": "bad", "content": error}]
+        authored = {"role":"user","content":"刚才聊过 invokeMCPTool"}
+        self.body["messages"] = block + [authored, env()]
+        before = copy.deepcopy(self.body)
+        out, _ = self.project()
+        self.assertEqual(self.body, before)
+        history = out["messages"]
+        self.assertEqual(len(history), 4)
+        self.assertEqual(history[0]["tool_calls"], [block[0]["tool_calls"][2]])
+        self.assertIn("我先查一下。", history[0]["content"])
+        self.assertIn("未执行", history[0]["content"])
+        self.assertEqual(history[1:3], [block[1], authored])
+        self.assertNotIn(native.DISPATCH, json.dumps([history[0],history[1],history[3]], ensure_ascii=False))
+
+    def test_only_exactly_paired_exclusions_are_omitted(self):
+        old = {"role":"assistant","tool_calls":[call(native.DISPATCH, "{}", "x")]}
+        pair = [old, {"role":"tool","tool_call_id":"x","content":native.EXCLUDED_RESULT}]
+        self.assertEqual(native.compact_dispatch_history(pair), [])
+        for receipt in ({"role":"tool","tool_call_id":"x","content":"a real result"},
+                        {"role":"tool","tool_call_id":"y","content":native.EXCLUDED_RESULT}):
+            self.assertEqual(native.compact_dispatch_history([old, receipt]), [old, receipt])
+
+    def test_service_directory_and_contract_give_the_next_real_call(self):
+        server_list = {"kind":"mcp_server_directory","items":[{"name":"Serein","handle":"serein"}]}
+        contract = {"kind":"mcp_tool_contract","tool":self.search["alias"]}
+        self.body["messages"] = [
+            {"role":"assistant","tool_calls":[call("listMCPTools", "{}", "d")]},
+            {"role":"tool","tool_call_id":"d","content":json.dumps(server_list)}, env()]
+        out, tools = self.project()
+        self.assertFalse(tools)
+        suggested = json.loads(out["messages"][1]["content"])["items"][0]["next_call"]
+        self.assertEqual(suggested, {"name":"listMCPTools","arguments":{"server":"serein"}})
+        self.assertIn("已展开 0 个", out["messages"][2]["content"])
+        self.body["messages"] += [
+            {"role":"assistant","tool_calls":[call("readMCPTool", json.dumps({"tool":self.search["alias"]}), "r")]},
+            {"role":"tool","tool_call_id":"r","content":json.dumps(contract)}]
+        out, tools = self.project()
+        self.assertEqual(set(tools), {"serein_search"})
+        self.assertEqual(json.loads(out["messages"][-1]["content"])["call_as"], "serein_search")
+        self.assertIn("已展开 1 个", out["messages"][2]["content"])
+
+    def test_known_call_without_sending_schemas(self):
+        opening = flat("openMemorySource", ["id"])
+        opening["alias"] = "mcp__openmemorysource__" + "a"*32
+        catalog = [{"server":"Serein","count":1,"tools":[opening]}]
+        self.body["messages"] = [env("Serein(1)")]
+        allowed = {}
+        out, exposed = native.project(self.body,catalog,is_aru_environment,as_text,response_tools=allowed)
+        self.assertFalse(exposed)
+        self.assertNotIn("serein_openMemorySource", json.dumps(out))
+        real_name = opening["function"]["name"]
+        old = json.dumps({"function":"openMemorySource","sourceId":"card-example"})
+        for name, raw in [(native.DISPATCH,old), (real_name,'{"id":"card-example"}'),
+                          (opening["alias"],'{"id":"card-example"}'),
+                          ("openMemorySource",'{"id":"card-example"}')]:
+            tc = call(name, raw, "id1")
+            native.restore({"choices":[{"message":{"tool_calls":[tc]},"finish_reason":"tool_calls"}]}, exposed, allowed)
+            self.assertEqual(tc["id"],"id1")
+            self.assertEqual(tc["function"]["name"],native.DISPATCH)
+            expected = {"tool":opening["alias"],"arguments":{"id":"card-example"}}
+            self.assertEqual(json.loads(tc["function"]["arguments"]), expected)
+            stream = native.StreamCalls(exposed, {}, allowed)
+            for n, text in enumerate([raw[:5],raw[5:]]):
+                fn = {"arguments":text}
+                if not n: fn["name"] = name
+                stream.apply({"choices":[{"delta":{"tool_calls":[{"index":0,"function":fn}]}}]})
+                self.assertNotIn("arguments",fn)
+            delta = {}
+            stream.apply({"choices":[{"delta":delta,"finish_reason":"tool_calls"}]})
+            self.assertEqual(json.loads(delta["tool_calls"][0]["function"]["arguments"]),expected)
+        for raw in ('{"function":"openMemorySource","id":"a","sourceId":"b"}',
+                    '{"function":"openMemorySource","sourceId":42}',
+                    '{"function":"openMemorySource","sourceId":"a","sourceId":"b"}',
+                    '{"function":"openMemorySource","server":"other","sourceId":"a"}'):
+            self.assertIsNone(native.known_call(native.DISPATCH,raw,allowed))
+        self.assertIsNone(native.known_call(native.DISPATCH,old,{}))
+        other = {**opening, "alias":"mcp__openmemorysource__" + "b"*32,
+                 "function":{**opening["function"], "name":"other_openMemorySource"}}
+        other_service = {"server":"Other","count":1,"tools":[other]}
+        both = {**self.body,"messages":[env("Serein(1)、Other(1)")]}
+        both["messages"][0]["content"] = both["messages"][0]["content"].replace("1 个服务", "2 个服务")
+        ambiguous = {}
+        native.project(both,[*catalog, other_service],is_aru_environment,as_text,response_tools=ambiguous)
+        self.assertIn("other_openMemorySource",ambiguous)
+        self.assertIn(real_name,ambiguous)
+        self.assertIsNone(native.known_call(native.DISPATCH,old,ambiguous))
+        self.body["tools"].insert(0, builtin("openMemorySource"))
+        local_collision = {}
+        native.project(self.body,catalog,is_aru_environment,as_text,response_tools=local_collision)
+        self.assertNotIn("openMemorySource",local_collision)
+        self.assertIsNone(native.known_call(native.DISPATCH,old,local_collision))
+        self.body["tools"][-1]["function"]["parameters"]["properties"] = {"tool":{"enum":["something-else"]}}
+        restricted = {}
+        native.project(self.body,catalog,is_aru_environment,as_text,response_tools=restricted)
+        self.assertEqual(restricted, {})
+
+    def test_unexpanded_calls_follow_the_catalog_schema_and_leave_client_tools_intact(self):
+        self.body["messages"] = [env()]
+        permitted = {}
+        _, projected = native.project(self.body, self.catalog, is_aru_environment, as_text, response_tools=permitted)
+        self.assertEqual(projected, {})
+        tagged = '<｜DSML｜parameter name="query" string="true">小窝'
+        cases = [("serein_search", tagged, self.search, {"query":"小窝"}),
+                 ("serein_list", "", self.listing, {}),
+                 ("serein_search", '{"query":"a","extra":1}', self.search, {"query":"a","extra":1})]
+        for name, raw, method, args in cases:
+            self.assertEqual(json.loads(native.known_call(name, raw, permitted)),
+                             {"tool":method["alias"],"arguments":args})
+        local = call("local",'{"id":"example"}',"internal")
+        original = copy.deepcopy(local)
+        part = {"choices":[{"message":{"tool_calls":[local]},"finish_reason":"tool_calls"}]}
+        self.assertFalse(native.restore(part, projected, permitted))
+        self.assertEqual(local, original)
+
     def test_malformed_never_redirects_no_args_and_interruption(self):
         bad = '{},"tool":"changed","arguments":{}'
         for raw,tool,expected in [(bad,self.search,None),("",self.search,None),("",self.listing,{}),

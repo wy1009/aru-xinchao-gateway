@@ -589,14 +589,14 @@ class OrganizerResult(VisibleChoices):
             )
 
 
-async def relay(upstream, completed, audit=None, meter=None, *, fix_mcp=False, projected=None):
+async def relay(upstream, completed, audit=None, meter=None, *, fix_mcp=False, projected=None, permitted=None):
     # OpenAI SSE events are UTF-8. Preserve their fields, including usage and tool-call deltas.
     data = []
     done = False
     try:
         lines = upstream.aiter_lines()
-        if projected or fix_mcp:
-            lines = aru_native_tools.stream_lines(lines, projected or {}, MCP_SCHEMAS if fix_mcp else None)
+        if projected or fix_mcp or permitted:
+            lines = aru_native_tools.stream_lines(lines, projected or {}, MCP_SCHEMAS if fix_mcp else None, permitted)
         async for line in lines:
             if line.startswith("data:"):
                 data.append(line[5:].lstrip(" "))
@@ -759,11 +759,16 @@ async def chat(req: Request, *, organizer=False):
             recall_status = "原话待确认，本轮未检索"
     provider = "Hindsight" if hindsight.ENABLED else ("Serein" if use_serein else "")
     audit_suffix = f" · {provider} {recall_status}" if provider else ""
+    permitted = {}
     try:
         outbound, projected = (body, {}) if organizer else aru_native_tools.project(
-            body, MCP_CATALOG, is_aru_environment, as_text)
+            body, MCP_CATALOG, is_aru_environment, as_text, response_tools=permitted)
     except aru_native_tools.UnavailableToolChoice as exc:
         return failure(400, str(exc))
+    # Projection can omit redacted historical call/receipt pairs. The attached
+    # state, when present, still immediately precedes the current user message.
+    audit_index = last_user_index(outbound["messages"])
+    audit_state = audit_index - 1 if state_index is not None and audit_index is not None else None
     sent_at = time.time()
     try:
         upstream = await client.send(
@@ -788,13 +793,13 @@ async def chat(req: Request, *, organizer=False):
     except httpx.HTTPError:
         if not organizer:
             await asyncio.to_thread(log_request, DB.parent / "prompt-audit", outbound["messages"],
-                                    user_index, state_index, sent_at, "上游连接异常，接收未确认" + audit_suffix)
+                                    audit_index, audit_state, sent_at, "上游连接异常，接收未确认" + audit_suffix)
         return failure(502, "The chat provider is unavailable.")
     audit = None
     if not organizer:
         directory = DB.parent / "prompt-audit"
-        record_id = await asyncio.to_thread(log_request, directory, outbound["messages"], user_index,
-                                            state_index, sent_at, f"模型服务 HTTP {upstream.status_code}" + audit_suffix)
+        record_id = await asyncio.to_thread(log_request, directory, outbound["messages"], audit_index,
+                                            audit_state, sent_at, f"模型服务 HTTP {upstream.status_code}" + audit_suffix)
         if record_id and upstream.is_success:
             audit = ReplyAudit(directory, record_id)
     meter = UsageCall(DB.parent / "prompt-audit", "organizer" if organizer else "chat",
@@ -804,7 +809,7 @@ async def chat(req: Request, *, organizer=False):
         "text/event-stream"
     ):
         return StreamingResponse(
-            relay(upstream, completed, audit, meter, fix_mcp=fix_mcp, projected=projected),
+            relay(upstream, completed, audit, meter, fix_mcp=fix_mcp, projected=projected, permitted=permitted),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
@@ -813,7 +818,7 @@ async def chat(req: Request, *, organizer=False):
         if upstream.is_success:
             chunk = json.loads(raw)
             repaired = fix_mcp and aru_mcp_arguments.repair([chunk], "message", MCP_SCHEMAS)
-            translated = projected and aru_native_tools.restore(chunk, projected)
+            translated = (projected or permitted) and aru_native_tools.restore(chunk, projected, permitted)
             if repaired or translated:
                 raw = json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode()
             meter.observe(chunk)

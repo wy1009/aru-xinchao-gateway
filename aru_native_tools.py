@@ -3,6 +3,10 @@ import json
 import re
 from pathlib import Path
 
+from jsonschema import Draft202012Validator
+from referencing import Registry
+from referencing.exceptions import Unresolvable
+
 import aru_mcp_arguments as dsml
 
 DISPATCH = "invokeMCPTool"
@@ -52,7 +56,7 @@ class UnavailableToolChoice(ValueError):
     pass
 
 
-def project(body, catalog, is_environment, as_text, *, single_tool=False):
+def project(body, catalog, is_environment, as_text, *, single_tool=False, response_tools=None):
     tools = body.get("tools") or []
     if not isinstance(tools, list) or any(not isinstance(t, dict) for t in tools):
         raise UnavailableToolChoice("Expected a tool definitions array.")
@@ -129,12 +133,35 @@ def project(body, catalog, is_environment, as_text, *, single_tool=False):
                     or allowed is not None and tool["alias"] not in allowed
                     or fn["name"] in originals):
                 continue
+            # Local reply validation only; these schemas do not enter the provider request.
+            if response_tools is not None:
+                response_tools[fn["name"]] = tool
             if single_tool:
                 expose = tool["alias"] == last_read
             else:
-                expose = name in selected or tool["alias"] in wanted or "listMCPTools" not in originals
+                expose = name in selected or tool["alias"] in wanted
             if expose:
                 projected[fn["name"]] = tool
+
+    if response_tools is not None:
+        # Aru lowercases the method portion of its handles. Recover the spelling
+        # from the independent function only when its suffix matches that handle.
+        short_names = {}
+        for tool in list(response_tools.values()):
+            short = tool["alias"].split("__")[1].lower()
+            short_names[short] = tool if short not in short_names else None
+            if tool["alias"] not in originals:
+                response_tools[tool["alias"]] = tool
+        for short, tool in short_names.items():
+            if tool is None:
+                continue
+            name = tool["function"]["name"]
+            spellings = {short}
+            if name.lower().endswith("_" + short):
+                spellings.add(name[-len(short):])
+            for spelling in spellings:
+                if spelling not in originals and spelling not in response_tools:
+                    response_tools[spelling] = tool
 
     visible = []
     for tool in tools:
@@ -142,15 +169,15 @@ def project(body, catalog, is_environment, as_text, *, single_tool=False):
         name = fn.get("name") if isinstance(fn, dict) else None
         if name == DISPATCH:
             continue
-        if name in DISCOVERY_HELP and DISPATCH in (fn.get("description") or ""):
+        if name in DISCOVERY_HELP:
             tool = {**tool, "function": {**fn, "description": DISCOVERY_HELP[name]}}
         visible.append(tool)
     visible.extend({"type": "function", "function": t["function"]} for t in projected.values())
     history = provider_history(messages, projected, catalog)
     for idx in environments:
-        history[idx] = provider_environment(history[idx], {} if choice == "none" else originals, single_tool)
+        history[idx] = provider_environment(history[idx], {} if choice == "none" else originals, single_tool, len(projected))
 
-    out = {**body, "messages": history}
+    out = {**body, "messages": compact_dispatch_history(history)}
     if isinstance(choice, dict) and choice.get("type") == "allowed_tools":
         limit = choice.get("allowed_tools", choice)
         permitted = [tool for tool in limit.get("tools", [])
@@ -174,20 +201,21 @@ def project(body, catalog, is_environment, as_text, *, single_tool=False):
 
 
 DISCOVERY_HELP = {
-    "listMCPTools": "按服务或查询列出 MCP 工具。下一次请求可直接调用 tools 中已展开的函数。",
-    "readMCPTool": "按目录中的工具标识读取参数定义。下一次请求按 tools 中的独立函数名调用。",
+    "listMCPTools": "不带参数时列出服务。选定服务后用 server 列出它的工具；回执里 call_as 是下一步可直接调用的函数名。",
+    "readMCPTool": "把工具目录条目的 tool 原样传入，读取并展开该方法。下一步按回执的 call_as 调用。",
 }
 
 
-def provider_environment(message, originals, single_tool):
-    steps = []
+def provider_environment(message, originals, single_tool, expanded_count):
+    steps = [f"本轮已展开 {expanded_count} 个外部方法。"]
     if "listMCPTools" in originals:
-        steps.append("可用 listMCPTools 查目录。")
+        steps.append("已知准确的独立函数名和业务参数时，可直接发起工具调用。需要确认名称或参数时，用 listMCPTools 的 server 参数打开目标服务。")
     if "readMCPTool" in originals:
-        steps.append("目录过大，请用 readMCPTool 单独展开所需工具。" if single_tool
-                     else "已知工具标识时可用 readMCPTool 读取该工具。")
-        steps.append("读取后仍未列出的方法，本轮不可用。")
-    steps.append("只调用本轮 tools 中列出的独立函数，直接填写它的业务参数。")
+        steps.append("已有目录条目的完整 tool 标识时，可直接用 readMCPTool 单独展开。标识从目录照抄。")
+        if single_tool:
+            steps.append("本次目录过大，请只展开所需的一项。")
+        steps.append("遇到工具名或参数错误，请查目录后按回执调用。")
+    steps.append("方法已在本轮 tools 时，直接用独立函数名填业务参数。")
 
     def update(match):
         header = match[0].split("。", 1)[0]
@@ -215,14 +243,14 @@ def exceeds_provider_limit(raw):
 def provider_history(messages, projected, catalog):
     by_alias = {t["alias"]: t["function"]["name"] for service in catalog for t in service["tools"]}
     current = {t["alias"]: name for name, t in projected.items()}
-    renamed, directories, history = {}, set(), []
+    renamed, discovery, history = {}, {}, []
     for msg in messages:
         if msg.get("role") == "assistant" and isinstance(msg.get("tool_calls"), list):
             calls = []
             for call in msg["tool_calls"]:
                 fn = call.get("function") if isinstance(call, dict) else None
-                if isinstance(fn, dict) and fn.get("name") == "listMCPTools" and call.get("id"):
-                    directories.add(call["id"])
+                if isinstance(fn, dict) and fn.get("name") in DISCOVERY_HELP and call.get("id"):
+                    discovery[call["id"]] = fn["name"]
                 if isinstance(fn, dict) and fn.get("name") == DISPATCH:
                     outer = parse(fn.get("arguments"))
                     if (isinstance(outer, dict) and isinstance(outer.get("tool"), str)
@@ -233,22 +261,93 @@ def provider_history(messages, projected, catalog):
                             renamed[call["id"]] = name
                 calls.append(call)
             msg = {**msg, "tool_calls": calls}
-        elif msg.get("role") == "tool" and msg.get("tool_call_id") in directories:
-            directories.remove(msg["tool_call_id"])
-            content = msg.get("content")
-            if isinstance(content, str):
-                receipt = parse(content)
-                if (isinstance(receipt, dict) and receipt.get("kind") == "mcp_tool_directory"
-                        and isinstance(receipt.get("items"), list)):
+        elif msg.get("role") == "tool" and msg.get("tool_call_id") in discovery:
+            method = discovery.pop(msg["tool_call_id"])
+            receipt = parse(msg.get("content"))
+            if isinstance(receipt, dict):
+                kind = receipt.get("kind")
+                if method == "listMCPTools" and kind == "mcp_server_directory" and isinstance(receipt.get("items"), list):
+                    for item in receipt["items"]:
+                        if isinstance(item, dict) and isinstance(item.get("handle"), str):
+                            item["next_call"] = {"name": "listMCPTools", "arguments": {"server": item["handle"]}}
+                    receipt["usage"] = "这是服务目录。选所需服务，调用该行的 next_call，取得工具目录。"
+                elif method == "listMCPTools" and kind == "mcp_tool_directory" and isinstance(receipt.get("items"), list):
                     for item in receipt["items"]:
                         if isinstance(item, dict) and isinstance(item.get("tool"), str) and item["tool"] in current:
                             item["call_as"] = current[item["tool"]]
-                    receipt["usage"] = "只调用本轮 tools 中的函数。需要单项参数定义时，按工具标识读取。"
+                    receipt["usage"] = "直接调用已列入本轮 tools 的 call_as。需要单项参数定义时，将该行的 tool 原样交给 readMCPTool。"
+                elif method == "readMCPTool" and kind == "mcp_tool_contract" and isinstance(receipt.get("tool"), str) and receipt["tool"] in current:
+                    receipt["call_as"] = current[receipt["tool"]]
+                    receipt["usage"] = "直接调用 call_as，只填写业务参数。"
+                elif method == "readMCPTool" and isinstance(receipt.get("error"), dict) and receipt["error"].get("code") == "readMCPTool.not_found":
+                    receipt["usage"] = "工具标识未找到。用 listMCPTools 的 server 参数列出目标服务，再照抄对应行的 tool 或调用已展开的 call_as。"
+                else:
+                    receipt = None
+                if receipt is not None:
                     msg = {**msg, "content": json.dumps(receipt, ensure_ascii=False)}
         elif msg.get("role") == "tool" and msg.get("name") == DISPATCH and msg.get("tool_call_id") in renamed:
             msg = {**msg, "name": renamed[msg["tool_call_id"]]}
         history.append(msg)
     return history
+
+
+EXCLUDED_RESULT = "[This tool result was excluded by the user. Its original content is not included.]"
+
+
+def compact_dispatch_history(messages):
+    """Omit matched redactions and summarize confirmed rejections in the provider copy only."""
+    simplified = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        i += 1
+        calls = msg.get("tool_calls")
+        if msg.get("role") != "assistant" or not isinstance(calls, list):
+            simplified.append(msg)
+            continue
+        start = i
+        while i < len(messages) and messages[i].get("role") == "tool":
+            i += 1
+        replies = messages[start:i]
+        by_id = {reply.get("tool_call_id"): reply for reply in replies}
+        if len(by_id) != len(replies) or len({c.get("id") for c in calls if isinstance(c, dict)}) != len(calls):
+            simplified.append(msg)
+            simplified.extend(replies)
+            continue
+        omitted = set()
+        rejected = False
+        for call in calls:
+            if not isinstance(call, dict) or (call.get("function") or {}).get("name") != DISPATCH:
+                continue
+            ident = call.get("id")
+            if not ident or ident not in by_id:
+                continue
+            result = by_id[ident].get("content")
+            if result == EXCLUDED_RESULT and parse(call["function"].get("arguments")) == {}:
+                omitted.add(ident)
+                continue
+            receipt = parse(result)
+            if (isinstance(receipt, dict) and set(receipt) <= {"error", "status"}
+                    and isinstance(receipt.get("error"), dict)
+                    and receipt["error"].get("code") == "invokeMCPTool.invalid_arguments"):
+                rejected = True
+                omitted.add(ident)
+        if omitted:
+            msg = {**msg}
+            remaining = [c for c in calls if not isinstance(c, dict) or c.get("id") not in omitted]
+            if remaining:
+                msg["tool_calls"] = remaining
+            else:
+                del msg["tool_calls"]
+            if rejected:
+                note = "〔有一次 MCP 调用参数校验失败，该工具未执行。〕"
+                content = msg.get("content")
+                msg["content"] = ([*content, {"type": "text", "text": note}] if isinstance(content, list)
+                                  else ((content or "") + "\n" + note).lstrip("\n"))
+        if not omitted or msg.get("tool_calls") or msg.get("content") or msg.get("refusal") or msg.get("function_call"):
+            simplified.append(msg)
+        simplified.extend(reply for reply in replies if reply.get("tool_call_id") not in omitted)
+    return simplified
 
 
 def wrapped(tool, raw, complete=True):
@@ -265,26 +364,95 @@ def wrapped(tool, raw, complete=True):
     return wire({"tool": tool["alias"], "arguments": args if complete and isinstance(args, dict) else None})
 
 
-def restore(chunk, projected):
+def known_call(name, raw, permitted):
+    """Resolve one completed structured call against the client's eligible methods."""
+    if not permitted or not isinstance(name, str):
+        return None
+    tool = permitted.get(name)
+    if name != DISPATCH and tool is None:
+        return None
+    if raw is not None and not isinstance(raw, str):
+        return None
+    if raw is None or not raw.strip():
+        args = {}
+    else:
+        try:
+            args = json.loads(raw, object_pairs_hook=dsml._unique, parse_constant=dsml._invalid_constant,
+                              parse_float=dsml._finite_float)
+        except (ValueError, RecursionError):
+            args = raw
+    if name == DISPATCH:
+        # Some models send the short method and its business fields to the old
+        # dispatcher. Resolve only an exact unique external method and never
+        # reinterpret a normal Aru wrapper or an explicitly scoped request.
+        if not isinstance(args, dict):
+            return None
+        method = args.pop("function", None)
+        if not isinstance(method, str) or {"server", "tool"} & args.keys():
+            return None
+        tool = permitted.get(method)
+        if set(args) == {"arguments"}:
+            args = args["arguments"]
+    if not tool:
+        return None
+    schema = tool["function"]["parameters"]
+    if dsml.tagged(args):
+        args = dsml.recover_parameters(args, tool["alias"], schema)
+    if not isinstance(args, dict):
+        return None
+    if tool["function"]["name"] == "serein_openMemorySource" and "sourceId" in args:
+        if "id" in args or "sourceId" in schema.get("properties", {}):
+            return None
+        args["id"] = args.pop("sourceId")
+    try:
+        if not Draft202012Validator(schema, registry=Registry()).is_valid(args):
+            return None
+    except (Unresolvable, ValueError, RecursionError):
+        return None
+    return wire({"tool": tool["alias"], "arguments": args})
+
+
+def outbound_arguments(name, raw, complete, projected, permitted):
+    tool = projected.get(name)
+    # Projected functions keep their existing DSML handling. The one known
+    # read-card spelling is accepted on both projected and unexpanded calls.
+    if tool and name != "serein_openMemorySource":
+        return wrapped(tool, raw, complete)
+    if complete:
+        result = known_call(name, raw, permitted)
+        if result is not None:
+            return result
+    if tool:
+        return wrapped(tool, raw, complete)
+    if name in permitted:
+        return wire({"tool": permitted[name]["alias"], "arguments": None})
+    return None
+
+
+def restore(chunk, projected, permitted=None):
     changed = False
+    permitted = permitted or {}
     for choice in chunk.get("choices") or ():
-        for call in (choice.get("message") or {}).get("tool_calls") or ():
-            fn = call.get("function") or {}
-            tool = projected.get(fn.get("name"))
-            if tool:
-                fn["name"] = DISPATCH
-                fn["arguments"] = wrapped(tool, fn.get("arguments"), choice.get("finish_reason") in ("stop", "tool_calls"))
+        complete = choice.get("finish_reason") in ("stop", "tool_calls", "function_call")
+        for _, fn in dsml.functions_in_choice(choice, "message"):
+            name = fn.get("name")
+            if name != DISPATCH and name not in projected and name not in permitted:
+                continue
+            args = outbound_arguments(name, fn.get("arguments"), complete, projected, permitted)
+            if args is not None:
+                fn.update(name=DISPATCH, arguments=args)
                 changed = True
     return changed
 
 
 class StreamCalls:
     """Assemble MCP arguments per choice and call; let ordinary text and other tools stream."""
-    def __init__(self, projected, dispatcher_schemas=None):
+    def __init__(self, projected, dispatcher_schemas=None, permitted=None):
         self.tools = projected
+        self.permitted = permitted or {}
         self.dispatcher_schemas = dispatcher_schemas
-        self.names = set(projected)
-        if dispatcher_schemas is not None:
+        self.names = set(projected) | self.permitted.keys()
+        if dispatcher_schemas is not None or self.permitted:
             self.names.add(DISPATCH)
         self.calls = {}
 
@@ -345,19 +513,18 @@ class StreamCalls:
                         if state["mode"] == "pending":
                             fn["name"] = DISPATCH
                         complete = reason in ("stop", "tool_calls", "function_call")
-                        if name == DISPATCH:
-                            repaired = dsml.corrected_arguments(args, self.dispatcher_schemas) if complete else None
-                            fn["arguments"] = repaired if repaired is not None else args
-                        else:
-                            fn["arguments"] = wrapped(self.tools[name], args, complete)
+                        result = outbound_arguments(name, args, complete, self.tools, self.permitted)
+                        if result is None and name == DISPATCH and complete:
+                            result = dsml.corrected_arguments(args, self.dispatcher_schemas)
+                        fn["arguments"] = result if result is not None else args
                     else:
                         fn.update(name=name, arguments=args)
                     changed = True
         return changed
 
 
-async def stream_lines(lines, projected, dispatcher_schemas=None):
-    adapter = StreamCalls(projected, dispatcher_schemas)
+async def stream_lines(lines, projected, dispatcher_schemas=None, permitted=None):
+    adapter = StreamCalls(projected, dispatcher_schemas, permitted)
     frame = []
     async for line in lines:
         if line:
