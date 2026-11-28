@@ -8,7 +8,10 @@ from urllib.parse import urlsplit
 
 KINDS = {"chat": "主聊天", "emotion": "情绪自评", "organizer": "Aru 记忆整理", "memory": "聊天记忆提取"}
 # Nanoyuan per token. SiliconFlow China lists ¥0.40 / ¥4 / ¥6 per million.
-PRICES = {("api.siliconflow.cn", "deepseek-ai/DeepSeek-V3.2"): (400, 4000, 6000)}
+PRICES = {
+    ("api.siliconflow.cn", "deepseek-ai/DeepSeek-V3.2"): (400, 4000, 6000),
+    ("api.siliconflow.cn", "Pro/deepseek-ai/DeepSeek-V3.2"): (400, 4000, 6000),
+}
 
 
 def token_count(value):

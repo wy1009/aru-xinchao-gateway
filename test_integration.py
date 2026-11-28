@@ -72,6 +72,71 @@ def spawn(stack, args, env, cwd):
 
 
 class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
+    async def test_client_model_selection_respects_explicit_model_and_records_pro(self):
+        pro = "Pro/" + gateway.V32
+        extra = "some-provider/OtherChat"
+        alias = "mcp__list_materials__" + "ab" * 16
+        bad = json.dumps({"tool":alias,"arguments":f'<｜DSML｜parameter name="tool" string="true">{alias}'})
+        registry_up = True
+        sent = []
+
+        def provider(req):
+            if req.method == "GET":
+                self.assertEqual(req.url.params["sub_type"], "chat")
+                if not registry_up:
+                    return httpx.Response(503)
+                return httpx.Response(200, json={"data":[{"id":pro},{"id":extra}]})
+            payload = json.loads(req.content)
+            sent.append(payload)
+            return httpx.Response(200, json={"id":f"call-{len(sent)}", "model":payload["model"],
+                "choices":[{"message":{"tool_calls":[{"function":{"name":"invokeMCPTool","arguments":bad}}]},
+                            "finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":8,"completion_tokens":2,"prompt_cache_hit_tokens":0}})
+
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
+            path = Path(folder) / "queue.db"
+            db = self.queue(path)
+            stack.callback(db.close)
+            for name, value in dict(DB=path, MODEL=gateway.V32, CHAT_MODEL=pro, CLIENT_MODEL_SELECTION=True,
+                                    CHAT="https://api.siliconflow.cn/v1", MIND_ENABLED=False, CHAT_MEMORY_IMPORT=False).items():
+                stack.enter_context(patch.object(gateway, name, value))
+            stack.enter_context(patch.object(gateway.serein, "ENABLED", False))
+            stack.enter_context(patch.object(gateway.hindsight, "ENABLED", False))
+            stack.enter_context(patch.object(gateway, "log_request", return_value=None))
+            stack.enter_context(patch.dict(os.environ, NIAN_CLIENT_SHA256=hashlib.sha256(b"fixture").hexdigest(),
+                                          XINCHAO_CHAT_API_KEY="fixture"))
+            async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as upstream, httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=gateway.app),base_url="http://test",headers=gateway.bearer("fixture")
+            ) as phone:
+                stack.enter_context(patch.object(gateway.app.state, "client", upstream, create=True))
+                stack.enter_context(patch.object(gateway.app.state, "db", db, create=True))
+                async def catalog(prefix):
+                    return [x["id"] for x in (await phone.get(prefix+"/models")).json()["data"]]
+                self.assertEqual(await catalog("/v1"), [pro,gateway.V32,extra])
+                registry_up = False
+                self.assertEqual(await catalog("/v1"), [pro,gateway.V32])
+                self.assertEqual(await catalog("/aru-memory/v1"), [gateway.V32])
+                payload = {"messages":[{"role":"user","content":"test"}],"tools":[{"type":"function","function":{
+                    "name":"invokeMCPTool"}}],"reasoning_effort":"low"}
+                for selected in (None, pro, gateway.V32, extra):
+                    args = {**payload,"model":selected} if selected is not None else payload
+                    response = await phone.post("/v1/chat/completions", json=args)
+                    response.raise_for_status()
+                    self.assertEqual(sent[-1]["model"],selected or pro)
+                    arguments = json.loads(response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])
+                    if selected != extra:
+                        self.assertEqual(sent[-1]["thinking_budget"],1024)
+                        self.assertEqual(arguments["arguments"],{})
+                    else:
+                        self.assertNotIn("thinking_budget",sent[-1])
+                        self.assertIsInstance(arguments["arguments"],str)
+                self.assertEqual((await phone.post("/aru-memory/v1/chat/completions",
+                                                  json={**payload,"model":pro})).status_code,400)
+                with sqlite3.connect(path.parent/"prompt-audit"/"usage.sqlite") as usage:
+                    pro_calls, known_fees = usage.execute(
+                        "SELECT count(*),count(nanoyuan) FROM calls WHERE model=?", (pro,)).fetchone()
+                    self.assertEqual((pro_calls,known_fees),(2,2))
+
     async def test_mind_disabled_keeps_memory_independent(self):
         with (
             tempfile.TemporaryDirectory() as temp,

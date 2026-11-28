@@ -28,7 +28,11 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 UPSTREAM = Path(os.environ.get("NIAN_UPSTREAM_DIR", "/opt/xinchao-nian/444e7db2"))
-MODEL = os.environ.get("NIAN_MODEL", "deepseek-ai/DeepSeek-V3.2")
+V32 = "deepseek-ai/DeepSeek-V3.2"
+V32_MODELS = (V32, "Pro/" + V32)
+MODEL = os.environ.get("NIAN_MODEL", V32)
+CHAT_MODEL = os.environ.get("NIAN_CHAT_MODEL", MODEL)
+CLIENT_MODEL_SELECTION = os.environ.get("NIAN_CLIENT_MODEL_SELECTION") == "1"
 ANALYSIS_MODEL = os.environ.get("NIAN_ANALYSIS_MODEL", MODEL)
 CHAT = os.environ.get("NIAN_CHAT_URL", "https://api.siliconflow.cn/v1").rstrip("/")
 THINKING_BUDGETS = {
@@ -625,20 +629,38 @@ async def relay(upstream, completed, audit=None, meter=None, *, fix_mcp=False, c
                 await asyncio.to_thread(audit.persist)
 
 
-async def models(req):
+async def models(req, *, organizer=False):
     if not authorized(req):
         return failure(401, "Invalid gateway key.")
+    names = [MODEL] if organizer or CHAT_MODEL == MODEL else [CHAT_MODEL, MODEL]
+    if CLIENT_MODEL_SELECTION and not organizer:
+        try:
+            catalog = await req.app.state.client.get(
+                CHAT + "/models", params={"type": "text", "sub_type": "chat"},
+                headers=bearer(os.environ["XINCHAO_CHAT_API_KEY"]), timeout=5,
+            )
+            catalog.raise_for_status()
+            for item in catalog.json()["data"]:
+                name = item.get("id")
+                if isinstance(name, str) and name and name not in names:
+                    names.append(name)
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError):
+            log.warning("Upstream chat model catalog unavailable")
     return JSONResponse(
         {
             "object": "list",
-            "data": [{"id": MODEL, "object": "model", "owned_by": "siliconflow"}],
+            "data": [{"id": name, "object": "model", "owned_by": "siliconflow"} for name in names],
         }
     )
 
 
+async def organizer_models(req):
+    return await models(req, organizer=True)
+
+
 def apply_siliconflow_effort(body):
     """Translate the client's effort into V3.2 controls, preserving explicit values."""
-    if body.get("model") != "deepseek-ai/DeepSeek-V3.2" or httpx.URL(CHAT).host not in (
+    if body.get("model") not in V32_MODELS or httpx.URL(CHAT).host not in (
         "api.siliconflow.cn",
         "api.siliconflow.com",
     ):
@@ -685,8 +707,14 @@ async def chat(req: Request, *, organizer=False):
             turn = turn_identity(req, body, messages)
     except (ValueError, TypeError, KeyError):
         return failure(400, "A valid chat messages array is required.")
-    if body.get("model") != MODEL:
-        return failure(400, f"Select {MODEL}.")
+    upstream_model = MODEL if organizer else CHAT_MODEL
+    if CLIENT_MODEL_SELECTION and not organizer:
+        upstream_model = body.get("model", CHAT_MODEL)
+        if not isinstance(upstream_model, str) or not upstream_model.strip():
+            return failure(400, "Expected a non-empty chat model ID.")
+    elif body.get("model") not in (MODEL, upstream_model):
+        return failure(400, f"Select {upstream_model}.")
+    body["model"] = upstream_model
     apply_siliconflow_effort(body)
     db = req.app.state.db
     state_index = None
@@ -749,8 +777,8 @@ async def chat(req: Request, *, organizer=False):
         if record_id and upstream.is_success:
             audit = ReplyAudit(directory, record_id)
     meter = UsageCall(DB.parent / "prompt-audit", "organizer" if organizer else "chat",
-                      CHAT, MODEL, body.get("n") or 1) if upstream.is_success else None
-    fix_mcp = (not organizer and MODEL == "deepseek-ai/DeepSeek-V3.2"
+                      CHAT, upstream_model, body.get("n") or 1) if upstream.is_success else None
+    fix_mcp = (not organizer and upstream_model in V32_MODELS
                and aru_mcp_arguments.advertised(body))
     if upstream.is_success and upstream.headers.get("content-type", "").startswith(
         "text/event-stream"
@@ -806,7 +834,7 @@ async def model_json(client, key_id, inputs, max_tokens, *, purpose, object_outp
         raise RuntimeError("provider key missing")
     payload = {
         **inputs,
-        "model": MODEL if use_chat_model else ANALYSIS_MODEL,
+        "model": CHAT_MODEL if use_chat_model else ANALYSIS_MODEL,
         "max_tokens": max_tokens,
         "temperature": 0,
         "enable_thinking": False,
@@ -1315,7 +1343,7 @@ app = Starlette(
     routes=[
         Route("/v1/models", models),
         Route("/v1/chat/completions", chat, methods=["POST"]),
-        Route("/aru-memory/v1/models", models),
+        Route("/aru-memory/v1/models", organizer_models),
         Route("/aru-memory/v1/chat/completions", organize, methods=["POST"]),
     ],
     lifespan=lifespan,
