@@ -20,6 +20,7 @@ from anyio import CancelScope
 from prompt_audit import log_emotion, log_request, log_reply
 from usage_ledger import UsageCall
 import aru_mcp_arguments
+import aru_native_tools
 import hindsight_gateway as hindsight
 import serein_gateway as serein
 from starlette.applications import Starlette
@@ -33,6 +34,7 @@ V32_MODELS = (V32, "Pro/" + V32)
 MODEL = os.environ.get("NIAN_MODEL", V32)
 CHAT_MODEL = os.environ.get("NIAN_CHAT_MODEL", MODEL)
 CLIENT_MODEL_SELECTION = os.environ.get("NIAN_CLIENT_MODEL_SELECTION") == "1"
+MCP_CATALOG = aru_native_tools.load(os.environ.get("NIAN_ARU_MCP_CATALOG"))
 ANALYSIS_MODEL = os.environ.get("NIAN_ANALYSIS_MODEL", MODEL)
 CHAT = os.environ.get("NIAN_CHAT_URL", "https://api.siliconflow.cn/v1").rstrip("/")
 THINKING_BUDGETS = {
@@ -586,7 +588,7 @@ class OrganizerResult(VisibleChoices):
             )
 
 
-async def relay(upstream, completed, audit=None, meter=None, *, fix_mcp=False, choices=1):
+async def relay(upstream, completed, audit=None, meter=None, *, fix_mcp=False, choices=1, projected=None):
     # OpenAI SSE events are UTF-8. Preserve their fields, including usage and tool-call deltas.
     data = []
     done = False
@@ -594,6 +596,8 @@ async def relay(upstream, completed, audit=None, meter=None, *, fix_mcp=False, c
         lines = upstream.aiter_lines()
         if fix_mcp:
             lines = aru_mcp_arguments.stream_lines(lines, choices)
+        if projected:
+            lines = aru_native_tools.stream_lines(lines, projected)
         async for line in lines:
             if line.startswith("data:"):
                 data.append(line[5:].lstrip(" "))
@@ -756,14 +760,23 @@ async def chat(req: Request, *, organizer=False):
             recall_status = "原话待确认，本轮未检索"
     provider = "Hindsight" if hindsight.ENABLED else ("Serein" if use_serein else "")
     audit_suffix = f" · {provider} {recall_status}" if provider else ""
+    outbound, projected = (body, {}) if organizer else aru_native_tools.project(
+        body, MCP_CATALOG, is_aru_environment, as_text)
     sent_at = time.time()
     try:
         upstream = await client.send(
             client.build_request(
-                "POST", CHAT + "/chat/completions", headers=bearer(key), json=body
+                "POST", CHAT + "/chat/completions", headers=bearer(key), json=outbound
             ),
             stream=True,
         )
+        if (projected and upstream.status_code in (400, 413, 422)
+                and aru_native_tools.exceeds_provider_limit(await upstream.aread())):
+            await upstream.aclose()
+            projected = {}
+            upstream = await client.send(client.build_request(
+                "POST", CHAT + "/chat/completions", headers=bearer(key), json=body), stream=True)
+            audit_suffix += " · 工具目录超过上游限制，已用 Aru 入口"
     except httpx.HTTPError:
         if not organizer:
             await asyncio.to_thread(log_request, DB.parent / "prompt-audit", messages,
@@ -784,7 +797,7 @@ async def chat(req: Request, *, organizer=False):
         "text/event-stream"
     ):
         return StreamingResponse(
-            relay(upstream, completed, audit, meter, fix_mcp=fix_mcp, choices=body.get("n") or 1),
+            relay(upstream, completed, audit, meter, fix_mcp=fix_mcp, choices=body.get("n") or 1, projected=projected),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
@@ -792,7 +805,9 @@ async def chat(req: Request, *, organizer=False):
         raw = await upstream.aread()
         if upstream.is_success:
             chunk = json.loads(raw)
-            if fix_mcp and aru_mcp_arguments.repair([chunk], "message"):
+            repaired = fix_mcp and aru_mcp_arguments.repair([chunk], "message")
+            translated = projected and aru_native_tools.restore(chunk, projected)
+            if repaired or translated:
                 raw = json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode()
             meter.observe(chunk)
             if audit is not None:

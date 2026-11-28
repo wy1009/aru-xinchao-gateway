@@ -95,3 +95,9 @@ Serein 上游仓库为 `https://github.com/Yinglianchun/Serein`，使用提交 `
 systemctl status nian-gateway gushou-serein gushou-serein-bridge gushou-serein-sync.timer gushou-serein-web
 journalctl -u gushou-serein-sync.service -n 12
 ```
+
+### Aru 外部工具按目录展开
+
+在网关的环境变量 `NIAN_ARU_MCP_CATALOG` 中指定一个服务进程可读的本地 JSON 文件。文件是服务数组，每项有 `server`（Aru 中的服务显示名）、`count`（当前开放的方法数）和 `tools`。每个工具的 `alias` 取自 Aru 目录返回的完整 `tool` 值，`function` 包含带服务前缀的唯一函数名、描述及真实的 JSON Schema（`parameters`）。调用标识属于该客户端配置，请保留在部署主机。更换服务、工具权限或参数定义后，应重新核对目录并重载网关。
+
+顾守保留 `listMCPTools` 和 `readMCPTool`。查看某个服务的目录后，下一次模型请求会带上该服务的方法定义。网关把模型返回的普通函数调用转换为 Aru 的 `invokeMCPTool`，保留调用 ID，由客户端校验参数、权限并执行。缺少对应定义或上游明确拒绝工具数量、上下文长度时，可继续走客户端已有的入口。
