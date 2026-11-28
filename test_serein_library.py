@@ -132,6 +132,63 @@ class Materials(unittest.TestCase):
             call('updateLongTermReference', content='误用标识', reference=latest['cardId'])
         self.assertEqual(len(call('list_materials')['items']), 1)
 
+    def test_material_history_is_bounded_and_restores_without_overwriting_edits(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from serein_library.api import routes
+        app = FastAPI()
+        app.include_router(routes(self.settings, []))
+        client = TestClient(app)
+        server = self.material_server()
+
+        def call(name, **args):
+            return asyncio.run(server.call_tool(name, args))[1]
+
+        for kind in store.CATEGORIES:
+            with self.subTest(kind=kind):
+                doc = store.create(self.db, kind, '标题甲', '甲\n乙\n')
+                url = '/v1/library/materials/' + doc
+                first = client.get(url + '/history').json()
+                self.assertEqual((first['versions'], first['selected_revision']), ([], None))
+                if kind == '长期资料':
+                    with store.connect(self.db, write=True) as db:
+                        db.execute('INSERT INTO companion_material_origin VALUES (?,?)', (doc, '迁入摘要'))
+                    store.update(self.db, doc, 1, title='标题乙', content='甲\n丙\n', summary='')
+                else:
+                    handle = call('openMemorySource', id=doc)['cardId']
+                    call('writeInformationCard', cardId=handle, subject='标题乙', content='甲\n丙\n')
+                diff = client.get(url + '/history').json()
+                fields = {d['field']:(d['before'], d['after']) for d in diff['changes']}
+                self.assertEqual(fields['content'], ('乙\n', '丙\n'))
+                self.assertEqual(fields['title'], ('标题甲', '标题乙'))
+                if kind == '长期资料':
+                    self.assertEqual(fields['summary'], ('迁入摘要',''))
+                self.assertEqual((diff['selected_revision'], diff['current_revision']), (1, 2))
+                store.update(self.db, doc, 2, content='甲\n丙\n')
+                store.update(self.db, doc, 2, content='第三稿')
+                def restore(target, expected):
+                    return client.post(f'{url}/history/{target}', json={'expected_revision':expected})
+                self.assertEqual(restore(1, 2).status_code, 409)
+                self.assertEqual(restore(1, 3).json()['revision'], 4)
+                self.assertFalse(client.get(url+'/history/1').json()['changes'])
+                with store.connect(self.db) as db:
+                    restored = db.execute('SELECT title,content FROM companion_material WHERE id=?',(doc,)).fetchone()
+                    self.assertEqual(tuple(restored), ('标题甲', '甲\n乙\n'))
+                    if kind == '长期资料':
+                        self.assertEqual(db.execute('SELECT summary FROM companion_material_summary WHERE id=?',
+                                                    (doc,)).fetchone()[0], '迁入摘要')
+                self.assertEqual(restore(3, 4).json()['revision'], 5)
+                for rev in range(5, 10):
+                    store.update(self.db, doc, rev, content=f'正文{rev}')
+                kept = client.get(url+'/history').json()['versions']
+                self.assertEqual([entry['revision'] for entry in kept], [9,8,7,6,5])
+                self.assertEqual(client.get(url+'/history/4').status_code, 404)
+                self.assertEqual(restore(4, 10).status_code, 404)
+                store.delete(self.db, doc, 10)
+                self.assertEqual(client.get(url+'/history').status_code, 404)
+                with store.connect(self.db) as db:
+                    self.assertFalse(db.execute('SELECT 1 FROM companion_material_history WHERE id=?',(doc,)).fetchone())
+
     def test_reference_summary_paging_import_alias_and_external_revision(self):
         from serein_library.aru_tools import PAGE_CHARS
         server = self.material_server()

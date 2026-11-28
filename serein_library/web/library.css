@@ -22,3 +22,15 @@
 .library-body p{margin:0 0 1em}.library-body blockquote{border-inline-start:3px solid #aac1b6;background:#f1f5f2;padding:.6em 1em}.library-body blockquote > :last-child{margin-bottom:0}
 .library-body th{background:#edf3ef}.library-body a{color:#365f51}.library-body li.task-list-item{list-style:none}
 @media(max-width:720px){.library-columns{grid-template-columns:1fr}.library-list{max-height:34vh;overflow:auto}.library-new{margin-inline-start:0}.library-page{padding-bottom:5rem}}
+
+.library-actions{flex-wrap:wrap}
+.library-history{margin:1.2rem 0 2rem}
+.library-history h3{font-size:1.15rem;font-weight:500;margin:0 0 1rem}
+.library-history label{display:flex;align-items:center;flex-wrap:wrap;gap:.6rem}
+.library-history select{max-width:100%;padding:.4rem;font:inherit;color:inherit;border:1px solid #bbc9c4;background:white;border-radius:.3rem}
+.library-difference{margin:1rem 0}
+.library-difference h4{font-size:.93rem;margin:0 0 .4rem;font-weight:600}
+.library-before,.library-after{padding:.55rem .8rem;border-inline-start:3px solid}
+.library-before{background:#fbf2ee;border-color:#c48a7d}.library-after{background:#eff6f1;border-color:#82a58e}
+.library-difference pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;line-height:1.65;margin:.2rem 0}
+.library-difference mark{color:inherit;background:#f0cfc5}.library-after mark{background:#cce3d1}

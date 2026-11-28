@@ -82,6 +82,23 @@ def routes(settings, auth):
         except store.RevisionConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @router.get('/materials/{identifier}/history')
+    @router.get('/materials/{identifier}/history/{revision}')
+    def history(identifier: str, revision: int | None = None):
+        try:
+            return store.history(settings.database, identifier, revision)
+        except store.SourceUnavailable as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @router.post('/materials/{identifier}/history/{revision}')
+    def restore(identifier: str, revision: int, data: ExpectedRevision):
+        try:
+            return store.restore(settings.database, identifier, revision, data.expected_revision)
+        except store.SourceUnavailable as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except store.RevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @router.post('/source')
     def source(data: Source):
         category = '原文' if data.id.startswith('raw:') else '事件'

@@ -15,6 +15,51 @@ async function request(path, method = "GET", payload) {
   return value;
 }
 
+const diffFields = { title: "标题", content: "正文", summary: "摘要" };
+const historyDate = new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" });
+
+function Difference({ change }) {
+  const { before, after } = change;
+  const chars = text => Array.from(text);
+  const old = chars(before), current = chars(after);
+  let start = 0, end = 0;
+  while (start < old.length && start < current.length && old[start] === current[start]) start++;
+  while (end < old.length - start && end < current.length - start &&
+    old[old.length - 1 - end] === current[current.length - 1 - end]) end++;
+  function line(value, label, className) {
+    if (!value.length) return null;
+    const stop = value.length - end;
+    const changed = value.slice(start, stop).join("");
+    const visible = changed && !changed.trim()
+      ? changed.replaceAll("\r", "␍").replaceAll("\n", "↵\n").replaceAll("\t", "⇥").replaceAll(" ", "·")
+      : changed;
+    return <div className={className}><small>{label}</small><pre>{value.slice(0, start).join("")}
+      {changed && <mark>{visible}</mark>}{value.slice(stop).join("")}</pre></div>;
+  }
+  const label = diffFields[change.field];
+  const location = change.field === "content" ? " · 第 " + (after ? change.new_line : change.old_line) + " 行" : "";
+  return <section className="library-difference"><h4>{label}{location}</h4>
+    {line(old, "历史版本", "library-before")}{line(current, "当前版本", "library-after")}
+  </section>;
+}
+
+function HistoryPanel({ data, busy, onSelect, onRestore }) {
+  return <section className="library-history" aria-label="历史版本"><h3>历史版本</h3>
+    {data.versions.length === 0 ? <p>还没有旧版本。下次修改时，会自动保留这一版。</p> : <>
+      <label>对比版本<select value={data.selected_revision} disabled={busy}
+        onChange={e => onSelect(Number(e.target.value))}>
+        {data.versions.map(v => <option key={v.revision} value={v.revision}>
+          版本 {v.revision} · {historyDate.format(new Date(v.replaced_at))} 归档
+        </option>)}</select></label>
+      <p>版本 {data.selected_revision} 与当前版本 {data.current_revision} 的差异</p>
+      {data.changes.length ? <>
+        {data.changes.map((change,i) => <Difference key={i} change={change}/>)}
+        <button disabled={busy} onClick={onRestore}>回退到版本 {data.selected_revision}</button>
+      </> : <p>两版内容相同。</p>}
+    </>}
+  </section>;
+}
+
 export function LibraryPage() {
   const [catalog, setCatalog] = useState([]);
   const [group, setGroup] = useState("信息卡");
@@ -22,6 +67,7 @@ export function LibraryPage() {
   const [scope, setScope] = useState("");
   const [results, setResults] = useState(null);
   const [doc, setDoc] = useState(null);
+  const [history, setHistory] = useState(null);
   const [draft, setDraft] = useState(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
@@ -37,7 +83,7 @@ export function LibraryPage() {
   function leaveEditor() {
     if (draft && (draft.title !== (doc?.title || "") || draft.content !== (doc?.content || "")) &&
         !window.confirm("放弃尚未保存的改动？")) return false;
-    setDraft(null);
+    setDraft(null); setHistory(null);
     return true;
   }
   function showGroup(value) {
@@ -61,7 +107,7 @@ export function LibraryPage() {
   }
   async function lookup(e) {
     e.preventDefault();
-    if (!query.trim() || !leaveEditor()) return;
+    if (busy || !query.trim() || !leaveEditor()) return;
     const version = ++pending.current;
     setBusy(true); setNotice("");
     try {
@@ -77,6 +123,31 @@ export function LibraryPage() {
     setDoc(null); setNotice("");
     setDraft({ kind:group, title:"", content:"", request_id:crypto.randomUUID() });
   }
+  async function showSaved(id, message) {
+    const latest = await request("materials/" + id);
+    setDoc(latest); setDraft(null); setHistory(null); setGroup(latest.kind); setResults(null);
+    setCatalog((await request("materials")).items);
+    setNotice(message);
+  }
+  async function showHistory(revision) {
+    setBusy(true); setNotice("");
+    try {
+      const path = "materials/" + doc.id + "/history";
+      setHistory(await request(revision ? path + "/" + revision : path));
+    } catch (err) { setNotice(err.message); }
+    finally { setBusy(false); }
+  }
+  async function restore() {
+    const target = history.selected_revision;
+    if (!window.confirm(`将「${history.current_title}」回退到版本 ${target}？当前版本会保留在历史中。`)) return;
+    setBusy(true); setNotice("");
+    try {
+      const saved = await request(`materials/${doc.id}/history/${target}`, "POST",
+        { expected_revision: history.current_revision });
+      await showSaved(saved.id, `已回退到版本 ${target} 的内容，当前为版本 ${saved.revision}。`);
+    } catch (err) { setNotice(err.message); }
+    finally { setBusy(false); }
+  }
   async function save(e) {
     e.preventDefault();
     setBusy(true); setNotice("");
@@ -84,10 +155,7 @@ export function LibraryPage() {
       const saved = doc ? await request("materials/" + doc.id, "PATCH",
         { expected_revision:doc.revision, title:draft.title, content:draft.content })
         : await request("materials", "POST", draft);
-      const latest = await request("materials/" + saved.id);
-      setDoc(latest); setDraft(null); setGroup(latest.kind); setResults(null);
-      setCatalog((await request("materials")).items);
-      setNotice("已保存");
+      await showSaved(saved.id, "已保存");
     } catch (err) { setNotice(err.message); }
     finally { setBusy(false); }
   }
@@ -136,14 +204,18 @@ export function LibraryPage() {
           onChange={e => setDraft({...draft,content:e.target.value})}/></label>
         <button disabled={busy}>保存</button> <button type="button" disabled={busy} onClick={leaveEditor}>取消</button>
       </form> : doc && <><header className="library-reader-header">
-        <div><small>{doc.kind}{doc.revision && ' · 版本 '+doc.revision}</small>
-          <h2 ref={heading} tabIndex={-1}>{doc.title}</h2></div>
+        <div><small>{doc.kind}{doc.revision && ' · 版本 '+(history?.current_revision ?? doc.revision)}</small>
+          <h2 ref={heading} tabIndex={-1}>{history?.current_title ?? doc.title}</h2></div>
         {categories.includes(doc.kind) && <div className="library-actions">
-          <button disabled={busy} onClick={() => setDraft({...doc})}>编辑</button>
-          <button className="library-delete" disabled={busy} onClick={remove}>删除</button>
+          {history ? <button disabled={busy} onClick={() => open(doc)}>返回正文</button> : <>
+            <button disabled={busy} onClick={() => setDraft({...doc})}>编辑</button>
+            <button disabled={busy} onClick={() => showHistory()}>历史版本</button>
+            <button className="library-delete" disabled={busy} onClick={remove}>删除</button>
+          </>}
         </div>}
       </header>
-        {doc.kind === "原文"
+        {history ? <HistoryPanel data={history} busy={busy} onSelect={showHistory} onRestore={restore}/>
+          : doc.kind === "原文"
           ? <div className="library-body library-original">{doc.content}</div>
           : <MarkdownProjection className="library-body" content={doc.content}/>}
       </>}

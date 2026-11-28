@@ -3,10 +3,12 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 CATEGORIES = ("信息卡", "长期资料")
+HISTORY_LIMIT = 5
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS companion_material(
  id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('信息卡','长期资料')),
@@ -18,6 +20,10 @@ CREATE TABLE IF NOT EXISTS companion_material_origin(
  id TEXT PRIMARY KEY, summary TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS companion_material_source(
  id TEXT NOT NULL, raw_id INTEGER NOT NULL, event_hash TEXT NOT NULL, PRIMARY KEY(id,raw_id));
+CREATE TABLE IF NOT EXISTS companion_material_history(
+ id TEXT NOT NULL, revision INTEGER NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL,
+ summary TEXT, replaced_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+ PRIMARY KEY(id, revision));
 CREATE TABLE IF NOT EXISTS companion_removed_import(source_id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS companion_search_vector(
  id TEXT NOT NULL, stamp TEXT NOT NULL, profile TEXT NOT NULL, part INTEGER NOT NULL,
@@ -120,6 +126,77 @@ def create(path, kind, title, content, key=None, *, source_id=None, summary=None
     return identifier
 
 
+def _current(db, identifier):
+    row = db.execute("""SELECT m.id,m.kind,m.revision,m.title,m.content,
+        CASE WHEN m.kind='长期资料' THEN coalesce(s.summary,o.summary,'') END AS summary
+        FROM companion_material m LEFT JOIN companion_material_summary s ON s.id=m.id
+        LEFT JOIN companion_material_origin o ON o.id=m.id WHERE m.id=?""", (identifier,)).fetchone()
+    if row is None:
+        raise SourceUnavailable('资料已不存在，请重新查看目录')
+    return row
+
+
+def _publish(db, row, title, content, summary):
+    """Archive the outgoing state and publish the next one in the same write transaction."""
+    identifier, revision = row['id'], row['revision']
+    if (title, content, summary) != (row['title'], row['content'], row['summary']):
+        db.execute("""INSERT INTO companion_material_history(id,revision,title,content,summary)
+            VALUES (?,?,?,?,?)""", (identifier, revision, row['title'], row['content'], row['summary']))
+        db.execute("""DELETE FROM companion_material_history WHERE id=? AND revision NOT IN
+            (SELECT revision FROM companion_material_history WHERE id=? ORDER BY revision DESC LIMIT ?)""",
+            (identifier, identifier, HISTORY_LIMIT))
+        if summary != row['summary']:
+            db.execute('INSERT OR REPLACE INTO companion_material_summary VALUES (?,?)', (identifier, summary))
+        revision += 1
+        db.execute('UPDATE companion_material SET title=?,content=?,revision=? WHERE id=?',
+                   (title, content, revision, identifier))
+        db.execute('DELETE FROM companion_search_vector WHERE id=?', (identifier,))
+    return {'id': identifier, 'kind': row['kind'], 'title': title, 'revision': revision}
+
+
+def _snapshot(db, identifier, revision):
+    row = db.execute('SELECT * FROM companion_material_history WHERE id=? AND revision=?',
+                     (identifier, revision)).fetchone()
+    if row is None:
+        raise SourceUnavailable('这个历史版本已不在保留范围内，请重新打开历史版本')
+    return row
+
+
+def history(path, identifier, selected=None):
+    with connect(path) as db:
+        db.execute('BEGIN')
+        current = _current(db, identifier)
+        versions = [dict(row) for row in db.execute("""SELECT revision,replaced_at FROM companion_material_history
+            WHERE id=? ORDER BY revision DESC""", (identifier,))]
+        if selected is None and versions:
+            selected = versions[0]['revision']
+        old = _snapshot(db, identifier, selected) if selected is not None else None
+
+    changes = []
+    if old is not None:
+        for key in ('title', 'summary', 'content'):
+            if old[key] == current[key]:
+                continue
+            before = old[key].splitlines(keepends=True)
+            after = current[key].splitlines(keepends=True)
+            for op, a, b, c, d in SequenceMatcher(None, before, after).get_opcodes():
+                if op != 'equal':
+                    changes.append({'field': key, 'old_line': a+1, 'new_line': c+1,
+                                    'before': ''.join(before[a:b]), 'after': ''.join(after[c:d])})
+    return {'current_revision': current['revision'], 'current_title': current['title'], 'versions': versions,
+            'selected_revision': selected, 'changes': changes}
+
+
+def restore(path, identifier, revision, expected_revision):
+    with connect(path, write=True) as db:
+        db.execute('BEGIN IMMEDIATE')
+        current = _current(db, identifier)
+        if current['revision'] != expected_revision:
+            raise RevisionConflict('资料刚刚更新了，请重新打开历史版本，核对差异后再回退。')
+        old = _snapshot(db, identifier, revision)
+        return _publish(db, current, old['title'], old['content'], old['summary'])
+
+
 def update(path, identifier, revision, *, title=None, content=None, old_text=None, new_text=None, summary=None):
     if (old_text is None) != (new_text is None) or (old_text is not None and content is not None):
         raise ValueError("请给完整正文，或给一对 old_text、new_text")
@@ -127,8 +204,8 @@ def update(path, identifier, revision, *, title=None, content=None, old_text=Non
         raise ValueError("请提供需要修改的内容")
     with connect(path, write=True) as db:
         db.execute('BEGIN IMMEDIATE')
-        row = db.execute('SELECT * FROM companion_material WHERE id=?', (identifier,)).fetchone()
-        if not row or row['revision'] != revision:
+        row = _current(db, identifier)
+        if row['revision'] != revision:
             raise ValueError("资料已变更或不存在。请按 ID 重读最新正文，再决定如何修改")
         if old_text is not None:
             if not old_text or row['content'].count(old_text) != 1:
@@ -137,22 +214,9 @@ def update(path, identifier, revision, *, title=None, content=None, old_text=Non
         title = row['title'] if title is None else title
         content = row['content'] if content is None else content
         validate(row['kind'], title, content)
-        summary_changed = False
-        if summary is not None:
-            if row['kind'] != '长期资料':
-                raise ValueError("只有长期资料可以修改摘要")
-            previous = db.execute("""SELECT coalesce(
-                (SELECT summary FROM companion_material_summary WHERE id=?),
-                (SELECT summary FROM companion_material_origin WHERE id=?),'')""",(identifier,identifier)).fetchone()[0]
-            summary_changed = previous != summary
-            if summary_changed:
-                db.execute('INSERT OR REPLACE INTO companion_material_summary VALUES (?,?)',(identifier,summary))
-        if summary_changed or (title, content) != (row['title'], row['content']):
-            db.execute('UPDATE companion_material SET title=?,content=?,revision=revision+1 WHERE id=?',
-                       (title, content, identifier))
-            db.execute('DELETE FROM companion_search_vector WHERE id=?', (identifier,))
-            revision += 1
-        return {'id': identifier, 'kind': row['kind'], 'title': title, 'revision': revision}
+        if summary is not None and row['kind'] != '长期资料':
+            raise ValueError('只有长期资料可以修改摘要')
+        return _publish(db, row, title, content, row['summary'] if summary is None else summary)
 
 
 def delete(path, identifier, revision):
@@ -166,7 +230,7 @@ def delete(path, identifier, revision):
         if row['source_id']:
             db.execute('INSERT INTO companion_removed_import VALUES (?)', (row['source_id'],))
         for table in ('companion_material_source', 'companion_material_origin', 'companion_material_summary',
-                      'companion_search_vector', 'companion_material'):
+                      'companion_search_vector', 'companion_material_history', 'companion_material'):
             db.execute(f'DELETE FROM {table} WHERE id=?', (identifier,))
         return {'id': identifier, 'deleted': True}
 

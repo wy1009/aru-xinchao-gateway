@@ -96,7 +96,7 @@
 -  const backend = chat || oauth;
 +  // The browser uses the existing Aru login. Only these library routes receive the private core credential.
 +  const libraryPrefix = '/__serein/library-api/';
-+  const library = path.startsWith(libraryPrefix) && /^(materials(\/(card|ref)-[0-9a-f]{16})?|search|source)$/.test(path.slice(libraryPrefix.length));
++  const library = path.startsWith(libraryPrefix) && /^(materials(\/(card|ref)-[0-9a-f]{16}(\/history(\/[1-9][0-9]*)?)?)?|search|source)$/.test(path.slice(libraryPrefix.length));
 +  const backend = chat || oauth || library;
    const target = backend ? core : new URL(`http://127.0.0.1:${process.env.SEREIN_PREVIEW_PORT || 4173}`);
    const headers = { ...req.headers, host: backend ? target.host : req.headers.host };
