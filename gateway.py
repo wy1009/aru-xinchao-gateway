@@ -759,8 +759,11 @@ async def chat(req: Request, *, organizer=False):
             recall_status = "原话待确认，本轮未检索"
     provider = "Hindsight" if hindsight.ENABLED else ("Serein" if use_serein else "")
     audit_suffix = f" · {provider} {recall_status}" if provider else ""
-    outbound, projected = (body, {}) if organizer else aru_native_tools.project(
-        body, MCP_CATALOG, is_aru_environment, as_text)
+    try:
+        outbound, projected = (body, {}) if organizer else aru_native_tools.project(
+            body, MCP_CATALOG, is_aru_environment, as_text)
+    except aru_native_tools.UnavailableToolChoice as exc:
+        return failure(400, str(exc))
     sent_at = time.time()
     try:
         upstream = await client.send(
@@ -771,20 +774,26 @@ async def chat(req: Request, *, organizer=False):
         )
         if (projected and upstream.status_code in (400, 413, 422)
                 and aru_native_tools.exceeds_provider_limit(await upstream.aread())):
-            await upstream.aclose()
-            projected = {}
-            upstream = await client.send(client.build_request(
-                "POST", CHAT + "/chat/completions", headers=bearer(key), json=body), stream=True)
-            audit_suffix += " · 工具目录超过上游限制，已用 Aru 入口"
+            try:
+                retry_body, retry_tools = aru_native_tools.project(
+                    body, MCP_CATALOG, is_aru_environment, as_text, single_tool=True)
+            except aru_native_tools.UnavailableToolChoice:
+                retry_body = None
+            if retry_body is not None and len(retry_tools) < len(projected):
+                await upstream.aclose()
+                outbound, projected = retry_body, retry_tools
+                upstream = await client.send(client.build_request(
+                    "POST", CHAT + "/chat/completions", headers=bearer(key), json=outbound), stream=True)
+                audit_suffix += " · 工具目录超过上游限制，已按单项工具重试"
     except httpx.HTTPError:
         if not organizer:
-            await asyncio.to_thread(log_request, DB.parent / "prompt-audit", messages,
+            await asyncio.to_thread(log_request, DB.parent / "prompt-audit", outbound["messages"],
                                     user_index, state_index, sent_at, "上游连接异常，接收未确认" + audit_suffix)
         return failure(502, "The chat provider is unavailable.")
     audit = None
     if not organizer:
         directory = DB.parent / "prompt-audit"
-        record_id = await asyncio.to_thread(log_request, directory, messages, user_index,
+        record_id = await asyncio.to_thread(log_request, directory, outbound["messages"], user_index,
                                             state_index, sent_at, f"模型服务 HTTP {upstream.status_code}" + audit_suffix)
         if record_id and upstream.is_success:
             audit = ReplyAudit(directory, record_id)

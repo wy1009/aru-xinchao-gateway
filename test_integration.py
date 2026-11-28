@@ -136,6 +136,52 @@ class GatewayIntegration(unittest.IsolatedAsyncioTestCase):
                         "SELECT count(*),count(nanoyuan) FROM calls WHERE model=?", (pro,)).fetchone()
                     self.assertEqual((pro_calls,known_fees),(2,2))
 
+    async def test_mcp_limit_retry_keeps_single_native_tool_and_client_wrapper(self):
+        from test_aru_native_tools import directory_fixture, call
+
+        search, _, catalog, body = directory_fixture()
+        alias = search["alias"]
+        body["model"] = gateway.MODEL
+        body["messages"].extend([
+            {"role": "assistant", "tool_calls": [call("readMCPTool", json.dumps({"tool": alias}), "read")]},
+            {"role": "tool", "tool_call_id": "read", "content": json.dumps({"kind": "mcp_tool_contract", "tool": alias})},
+        ])
+        sent = []
+
+        def provider(req):
+            body = json.loads(req.content)
+            self.assertNotIn("invokeMCPTool", json.dumps(body))
+            sent.append([tool["function"]["name"] for tool in body["tools"]])
+            if len(sent) == 1:
+                return httpx.Response(400, text="too many tools")
+            return httpx.Response(200, json={"choices": [{"finish_reason": "tool_calls",
+                "message": {"tool_calls": [call("serein_search", '{"query":"sample"}', "call42")]}}]})
+
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
+            path = Path(folder) / "queue.db"
+            db = self.queue(path)
+            stack.callback(db.close)
+            for name, value in dict(DB=path, MIND_ENABLED=False, CHAT_MEMORY_IMPORT=False,
+                                    MCP_CATALOG=catalog).items():
+                stack.enter_context(patch.object(gateway, name, value))
+            stack.enter_context(patch.object(gateway.serein, "ENABLED", False))
+            stack.enter_context(patch.object(gateway.hindsight, "ENABLED", False))
+            stack.enter_context(patch.object(gateway, "log_request", return_value=None))
+            stack.enter_context(patch.dict(os.environ, NIAN_CLIENT_SHA256=hashlib.sha256(b"fixture").hexdigest(),
+                                          XINCHAO_CHAT_API_KEY="fixture"))
+            async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as upstream, httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=gateway.app), base_url="http://test", headers=gateway.bearer("fixture")
+            ) as phone:
+                stack.enter_context(patch.object(gateway.app.state, "client", upstream, create=True))
+                stack.enter_context(patch.object(gateway.app.state, "db", db, create=True))
+                response = await phone.post("/v1/chat/completions", json=body)
+            response.raise_for_status()
+            self.assertEqual(sent[0], ["local", "listMCPTools", "readMCPTool", "serein_search", "serein_list"])
+            self.assertEqual(sent[1], sent[0][:-1])
+            tc = response.json()["choices"][0]["message"]["tool_calls"][0]
+            self.assertEqual((tc["id"], tc["function"]["name"]), ("call42", "invokeMCPTool"))
+            self.assertEqual(json.loads(tc["function"]["arguments"]), {"tool": alias, "arguments": {"query": "sample"}})
+
     async def test_mind_disabled_keeps_memory_independent(self):
         with (
             tempfile.TemporaryDirectory() as temp,

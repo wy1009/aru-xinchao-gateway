@@ -48,42 +48,48 @@ def directory(value):
     return None
 
 
-def project(body, catalog, is_environment, as_text):
-    tools = body.get("tools")
-    if (not catalog or not isinstance(tools, list) or body.get("tool_choice") == "none"
-            or isinstance(body.get("tool_choice"), dict)):
-        return body, {}
+class UnavailableToolChoice(ValueError):
+    pass
+
+
+def project(body, catalog, is_environment, as_text, *, single_tool=False):
+    tools = body.get("tools") or []
+    if not isinstance(tools, list) or any(not isinstance(t, dict) for t in tools):
+        raise UnavailableToolChoice("Expected a tool definitions array.")
     originals = {t["function"].get("name"): t["function"] for t in tools
                  if isinstance(t, dict) and isinstance(t.get("function"), dict)}
-    if DISPATCH not in originals:
-        return body, {}
-    params = originals[DISPATCH].get("parameters") or {}
-    if set(params.get("required") or ()) - {"tool", "arguments"}:
-        return body, {}
-    selector = (params.get("properties") or {}).get("tool") or {}
-    allowed = selector.get("enum")
-    if "const" in selector:
-        allowed = [selector["const"]]
     messages = body["messages"]
-    env = next((m for m in reversed(messages) if is_environment(m)), None)
-    if not env:
+    environments = [i for i, msg in enumerate(messages) if is_environment(msg)]
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict) and (choice.get("function") or {}).get("name") == DISPATCH:
+        raise UnavailableToolChoice("Select an individual MCP function or use automatic tool choice.")
+    if DISPATCH not in originals and not environments and not isinstance(choice, dict):
         return body, {}
-    roster = next((line for line in as_text(env.get("content")).splitlines()
-                   if line.startswith("mcp.tools:")), "")
-    # Only the roster segment gives the active server names and counts.
+
+    # Only the latest client environment can authorize projection. Older prompts
+    # still need their provider-facing instructions updated after a turn reset.
+    roster = ""
+    if environments:
+        content = as_text(messages[environments[-1]].get("content"))
+        roster = next((line for line in content.splitlines() if line.startswith("mcp.tools:")), "")
     counts = re.search(r"([0-9]+) 个服务：([^。]+)", roster)
-    if not counts:
-        return body, {}
-    active = {s.strip(): int(n) for s, n in re.findall(r"([^、,，]+?)\(([0-9]+)\)", counts[2])}
-    if not active or len(active) != int(counts[1]):
-        return body, {}
+    active = {s.strip(): int(n) for s, n in re.findall(r"([^、,，]+?)\(([0-9]+)\)", counts[2])} if counts else {}
+    params = originals.get(DISPATCH, {}).get("parameters") or {}
+    if (DISPATCH not in originals or choice == "none" or isinstance(choice, dict)
+            or not counts or len(active) != int(counts[1])
+            or set(params.get("required") or ()) - {"tool", "arguments"}):
+        active = {}
+    selector = (params.get("properties") or {}).get("tool") or {}
+    allowed = [selector["const"]] if "const" in selector else selector.get("enum")
 
     # A newer directory receipt takes precedence over the installed alias snapshot.
     pending, available = {}, {}
     selected, wanted = set(), set()
+    last_read = None
     for msg in messages:
         if msg.get("role") == "user" and not is_environment(msg):
             selected, wanted = set(), set()
+            last_read = None
         elif msg.get("role") == "assistant":
             for call in msg.get("tool_calls") or ():
                 fn = call.get("function") if isinstance(call, dict) else None
@@ -104,11 +110,12 @@ def project(body, catalog, is_environment, as_text):
                     selected.add(info[0])
             elif isinstance(receipt, dict) and not receipt.get("error"):
                 args = parse(fn.get("arguments"))
-                if isinstance(args, dict) and isinstance(args.get("tool"), str):
-                    wanted.add(args["tool"])
+                if (isinstance(args, dict) and isinstance(args.get("tool"), str)
+                        and receipt.get("kind") == "mcp_tool_contract" and receipt.get("tool") == args["tool"]):
+                    last_read = args["tool"]
+                    wanted.add(last_read)
 
     projected = {}
-    covered = set()
     for service in catalog:
         name = service["server"]
         if name not in active:
@@ -116,49 +123,86 @@ def project(body, catalog, is_environment, as_text):
         handles = available.get(name)
         if (len(handles) if handles is not None else service["count"]) != active[name]:
             continue
-        included = 0
         for tool in service["tools"]:
             fn = tool["function"]
             if (handles is not None and tool["alias"] not in handles
                     or allowed is not None and tool["alias"] not in allowed
                     or fn["name"] in originals):
                 continue
-            if name in selected or tool["alias"] in wanted or "listMCPTools" not in originals:
+            if single_tool:
+                expose = tool["alias"] == last_read
+            else:
+                expose = name in selected or tool["alias"] in wanted or "listMCPTools" not in originals
+            if expose:
                 projected[fn["name"]] = tool
-            included += 1
-        if included == active[name]:
-            covered.add(name)
-    all_covered = covered == active.keys()
-    if not projected and not all_covered:
-        return body, {}
+
     visible = []
     for tool in tools:
-        fn = tool.get("function") if isinstance(tool, dict) else None
+        fn = tool.get("function")
         name = fn.get("name") if isinstance(fn, dict) else None
-        if all_covered and name == DISPATCH:
-            continue
         if name == DISPATCH:
-            fn = {**fn, "description": "如本轮已有对应的独立函数，请直接调用该函数。其余 MCP 工具可用此入口。 " + (fn.get("description") or "")}
-            tool = {**tool, "function": fn}
+            continue
+        if name in DISCOVERY_HELP and DISPATCH in (fn.get("description") or ""):
+            tool = {**tool, "function": {**fn, "description": DISCOVERY_HELP[name]}}
         visible.append(tool)
     visible.extend({"type": "function", "function": t["function"]} for t in projected.values())
-    history = provider_history(messages, projected)
-    # Align the app-generated instructions with the provider-facing tool definitions.
-    if all_covered:
-        idx = next(i for i in range(len(messages) - 1, -1, -1) if messages[i] is env)
-        content = env["content"]
-        if "listMCPTools" in originals:
-            note = roster.split("。", 1)[0] + "。用 listMCPTools 查看所需服务的目录；已展开的方法按 tools 中的独立函数名和参数直接调用。"
-            if "readMCPTool" in originals:
-                note += "需要详情时可用 readMCPTool。"
+    history = provider_history(messages, projected, catalog)
+    for idx in environments:
+        history[idx] = provider_environment(history[idx], {} if choice == "none" else originals, single_tool)
+
+    out = {**body, "messages": history}
+    if isinstance(choice, dict) and choice.get("type") == "allowed_tools":
+        limit = choice.get("allowed_tools", choice)
+        permitted = [tool for tool in limit.get("tools", [])
+                     if (tool.get("function") or {}).get("name") != DISPATCH]
+        if permitted:
+            limit = {**limit, "tools": permitted}
+            out["tool_choice"] = {**choice, "allowed_tools": limit} if "allowed_tools" in choice else limit
+        elif limit.get("mode") == "required":
+            raise UnavailableToolChoice("No individual function is permitted for the required tool call.")
         else:
-            note = roster.split("。", 1)[0] + "。按 tools 中的独立函数名和参数直接调用。"
-        if isinstance(content, str):
-            content = content.replace(roster, note, 1)
-        else:
-            content = [{**part, "text": part["text"].replace(roster, note, 1)} for part in content]
-        history[idx] = {**history[idx], "content": content}
-    return {**body, "tools": visible, "messages": history}, projected
+            out["tool_choice"] = "none"
+    if visible:
+        out["tools"] = visible
+    elif "tools" in body:
+        out.pop("tools")
+        if choice == "required":
+            raise UnavailableToolChoice("No individual function is available for the required tool call.")
+        if out.get("tool_choice") in ("auto", "none"):
+            out.pop("tool_choice")
+    return out, projected
+
+
+DISCOVERY_HELP = {
+    "listMCPTools": "按服务或查询列出 MCP 工具。下一次请求可直接调用 tools 中已展开的函数。",
+    "readMCPTool": "按目录中的工具标识读取参数定义。下一次请求按 tools 中的独立函数名调用。",
+}
+
+
+def provider_environment(message, originals, single_tool):
+    steps = []
+    if "listMCPTools" in originals:
+        steps.append("可用 listMCPTools 查目录。")
+    if "readMCPTool" in originals:
+        steps.append("目录过大，请用 readMCPTool 单独展开所需工具。" if single_tool
+                     else "已知工具标识时可用 readMCPTool 读取该工具。")
+        steps.append("读取后仍未列出的方法，本轮不可用。")
+    steps.append("只调用本轮 tools 中列出的独立函数，直接填写它的业务参数。")
+
+    def update(match):
+        header = match[0].split("。", 1)[0]
+        if DISPATCH in header:
+            header = "mcp.tools: MCP 工具目录"
+        return header + "。" + "".join(steps)
+
+    content = message["content"]
+    # is_environment accepts only a string or a single text part.
+    part = content[0] if isinstance(content, list) else None
+    text = part["text"] if part else content
+    rewritten = re.sub(r"(?m)^mcp\.tools:[^\r\n]*", update, text)
+    if rewritten == text:
+        return message
+    return {**message, "content": [{**part, "text": rewritten}] if part else rewritten}
 
 
 def exceeds_provider_limit(raw):
@@ -168,8 +212,9 @@ def exceeds_provider_limit(raw):
         "maximum context", "context size", "context_length_exceeded", "工具数量超过"))
 
 
-def provider_history(messages, projected):
-    by_alias = {t["alias"]: name for name, t in projected.items()}
+def provider_history(messages, projected, catalog):
+    by_alias = {t["alias"]: t["function"]["name"] for service in catalog for t in service["tools"]}
+    current = {t["alias"]: name for name, t in projected.items()}
     renamed, directories, history = {}, set(), []
     for msg in messages:
         if msg.get("role") == "assistant" and isinstance(msg.get("tool_calls"), list):
@@ -196,11 +241,10 @@ def provider_history(messages, projected):
                 if (isinstance(receipt, dict) and receipt.get("kind") == "mcp_tool_directory"
                         and isinstance(receipt.get("items"), list)):
                     for item in receipt["items"]:
-                        if isinstance(item, dict) and isinstance(item.get("tool"), str) and item["tool"] in by_alias:
-                            item["call_as"] = by_alias[item["tool"]]
-                    if any(isinstance(i, dict) and "call_as" in i for i in receipt["items"]):
-                        receipt["usage"] = "已展开的方法直接调用 call_as 所列函数，只传其业务参数。"
-                        msg = {**msg, "content": json.dumps(receipt, ensure_ascii=False)}
+                        if isinstance(item, dict) and isinstance(item.get("tool"), str) and item["tool"] in current:
+                            item["call_as"] = current[item["tool"]]
+                    receipt["usage"] = "只调用本轮 tools 中的函数。需要单项参数定义时，按工具标识读取。"
+                    msg = {**msg, "content": json.dumps(receipt, ensure_ascii=False)}
         elif msg.get("role") == "tool" and msg.get("name") == DISPATCH and msg.get("tool_call_id") in renamed:
             msg = {**msg, "name": renamed[msg["tool_call_id"]]}
         history.append(msg)

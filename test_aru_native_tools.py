@@ -28,16 +28,21 @@ def env(roster="Serein(2)"):
     return {"role": "user", "content": text}
 
 
+def directory_fixture():
+    search, listing = flat("search", ["query"]), flat("list")
+    catalog = [{"server": "Serein", "count": 2, "tools": [search, listing]}]
+    body = {"tools": [builtin(n) for n in ("local", "listMCPTools", "readMCPTool", native.DISPATCH)],
+                 "messages": [{"role":"user","content":"列目录"}, {"role":"assistant",
+                     "tool_calls":[call("listMCPTools", "{}", "dir")]}, {"role":"tool","tool_call_id":"dir",
+                     "content":json.dumps({"kind":"mcp_tool_directory","scope":"server","complete":True,
+                        "server":{"name":"Serein"},"items":[{"tool":t["alias"]} for t in (search,listing)]})},
+                     env()]}
+    return search, listing, catalog, body
+
+
 class NativeTools(unittest.TestCase):
     def setUp(self):
-        self.search, self.listing = flat("search", ["query"]), flat("list")
-        self.catalog = [{"server": "Serein", "count": 2, "tools": [self.search, self.listing]}]
-        self.body = {"tools": [builtin(n) for n in ("local", "listMCPTools", "readMCPTool", native.DISPATCH)],
-                     "messages": [{"role":"user","content":"列目录"}, {"role":"assistant",
-                         "tool_calls":[call("listMCPTools", "{}", "dir")]}, {"role":"tool","tool_call_id":"dir",
-                         "content":json.dumps({"kind":"mcp_tool_directory","scope":"server","complete":True,
-                            "server":{"name":"Serein"},"items":[{"tool":t["alias"]} for t in (self.search,self.listing)]})},
-                         env()]}
+        self.search, self.listing, self.catalog, self.body = directory_fixture()
 
     def project(self):
         return native.project(self.body, self.catalog, is_aru_environment, as_text)
@@ -65,12 +70,13 @@ class NativeTools(unittest.TestCase):
         self.assertEqual(self.project()[1], {})
         self.body["messages"].pop()
         self.body["tool_choice"] = {"type": "function", "function": {"name": native.DISPATCH}}
-        self.assertEqual(self.project()[1], {})
+        with self.assertRaises(native.UnavailableToolChoice):
+            self.project()
         del self.body["tool_choice"]
         self.body["tools"].append(builtin("serein_search"))
         out, mapping = self.project()
         self.assertEqual(set(mapping), {"serein_list"})
-        self.assertIn(native.DISPATCH, [t["function"]["name"] for t in out["tools"]])
+        self.assertNotIn(native.DISPATCH, [t["function"]["name"] for t in out["tools"]])
         del self.body["tools"][-1]
         receipt = {"kind":"mcp_tool_directory", "scope":"server", "complete":True, "server":{"name":"Serein"},
                    "items":[{"tool":self.listing["alias"]},{"tool":"changed"}]}
@@ -90,7 +96,60 @@ class NativeTools(unittest.TestCase):
         self.assertEqual([t["function"]["name"] for t in out["tools"]], ["local","listMCPTools","readMCPTool"])
         self.assertIn("Serein(2)", out["messages"][0]["content"])
         self.body["messages"]=[env("new(7)")]
-        self.assertIs(self.project()[0], self.body)
+        out, mapping = self.project()
+        self.assertFalse(mapping)
+        self.assertNotIn(native.DISPATCH, json.dumps(out))
+
+    def test_all_prompt_copies_and_discovery_only_retry(self):
+        earlier = env("Unknown(4)")
+        earlier["content"] = [{"type": "text", "text": earlier["content"]}]
+        self.body["messages"].insert(0, earlier)
+        self.body["tools"][1]["function"]["description"] = "Call invokeMCPTool after listing."
+        for catalog in ([], self.catalog):
+            for choice in ("auto", "none", {"type":"function", "function":{"name":"local"}}):
+                self.body["tool_choice"] = choice
+                out, _ = native.project(self.body, catalog, is_aru_environment, as_text)
+                self.assertNotIn(native.DISPATCH, json.dumps(out))
+        del self.body["tool_choice"]
+        def compact():
+            return native.project(self.body, self.catalog, is_aru_environment, as_text, single_tool=True)
+        self.assertEqual(compact()[1], {})
+        self.body["messages"] += [
+            {"role":"assistant","tool_calls":[call("readMCPTool",json.dumps({"tool":self.search["alias"]}),"read")]},
+            {"role":"tool","tool_call_id":"read","content":json.dumps({"kind":"mcp_tool_contract","tool":self.search["alias"]})}]
+        out, mapping = compact()
+        self.assertEqual(set(mapping), {"serein_search"})
+        self.assertNotIn(native.DISPATCH, json.dumps(out))
+        self.body["messages"].append({"role":"user","content":"再查一次"})
+        self.assertEqual(self.project()[1], {})
+        self.assertEqual(compact()[1], {})
+
+    def test_single_discovery_after_new_turn(self):
+        self.body["messages"] += [
+            {"role":"user","content":"看看详情"},
+            {"role":"assistant","tool_calls":[call("readMCPTool",json.dumps({"tool":self.search["alias"]}),"r")]},
+            {"role":"tool","tool_call_id":"r","content":json.dumps({"kind":"mcp_tool_contract","tool":self.search["alias"]})}]
+        out, mapping = self.project()
+        self.assertEqual(set(mapping), {"serein_search"})
+        self.assertNotIn(native.DISPATCH, json.dumps(out))
+
+    def test_wrapper_only_missing_roster_and_required_choices(self):
+        body = {"messages":[{"role":"user","content":"invokeMCPTool 是什么？"}],
+                "tools":[builtin(native.DISPATCH)],"tool_choice":"auto"}
+        out, mapping = native.project(body, [], is_aru_environment, as_text)
+        self.assertEqual(out, {"messages":body["messages"]})
+        self.assertFalse(mapping)
+        body["tool_choice"] = "required"
+        with self.assertRaises(native.UnavailableToolChoice):
+            native.project(body, [], is_aru_environment, as_text)
+
+    def test_restricted_tool_selection_preserves_local_choice(self):
+        allowed = {"type":"allowed_tools", "allowed_tools":{"mode":"required",
+                   "tools":[{"type":"function","function":{"name":name}} for name in (native.DISPATCH, "local")]}}
+        self.body["tool_choice"] = allowed
+        out, _ = self.project()
+        self.assertEqual(out["tool_choice"]["allowed_tools"], {"mode":"required","tools":[allowed["allowed_tools"]["tools"][1]]})
+        self.assertNotIn(native.DISPATCH, json.dumps(out))
 
     def test_malformed_never_redirects_no_args_and_interruption(self):
         bad = '{},"tool":"changed","arguments":{}'
