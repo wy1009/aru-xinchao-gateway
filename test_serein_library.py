@@ -53,6 +53,44 @@ class Materials(unittest.TestCase):
         register(server, self.settings)
         return server
 
+    def test_admin_deletion_checks_revision_and_removes_only_the_selected_material(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from serein_library.api import routes
+        app = FastAPI()
+        app.include_router(routes(self.settings, []))
+        client = TestClient(app)
+        for kind in store.CATEGORIES:
+            with self.subTest(kind=kind):
+                item = store.create(self.db, kind, '测试', '原始正文', source_id=kind)
+                url = '/v1/library/materials/' + item
+                keep = store.create(self.db, kind, '同名', '单独保留')
+                store.update(self.db, item, 1, content='编辑后的正文')
+                with store.connect(self.db, write=True) as db:
+                    db.execute('INSERT INTO companion_material_origin VALUES (?,?)', (item, '迁入时的摘要'))
+                    db.execute('INSERT INTO companion_material_summary VALUES (?,?)', (item, '摘要'))
+                    db.execute('INSERT INTO companion_material_source VALUES (?,1,?)', (item, 'hash'))
+                    db.execute('INSERT INTO companion_search_vector VALUES (?,2,?,0,?)', (item, 'p', b'vec'))
+                self.assertEqual(client.delete(url).status_code, 422)
+                def remove(revision):
+                    return client.request('DELETE', url, json={'expected_revision':revision})
+                self.assertEqual(remove(1).status_code, 409)
+                self.assertIn(item, [r['id'] for r in store.catalog(self.db)])
+                self.assertEqual(remove(2).json(), {'id':item, 'deleted':True})
+                self.assertEqual(remove(2).json(), {'id':item, 'deleted':False})
+                with self.assertRaises(store.SourceUnavailable):
+                    store.read(self.db, item)
+                with self.assertRaises(store.RemovedImport):
+                    store.create(self.db, kind, '测试', '原始正文', source_id=kind)
+                with store.connect(self.db, write=True) as db:
+                    # A pending embedding from before deletion finishes after the admin request.
+                    db.execute('INSERT INTO companion_search_vector VALUES (?,2,?,0,?)', (item, 'p', b'late'))
+                    for table in ('companion_search_vector', 'companion_material_source',
+                                  'companion_material_summary', 'companion_material_origin'):
+                        self.assertFalse(db.execute(f'SELECT 1 FROM {table} WHERE id=?', (item,)).fetchone())
+                self.assertNotIn(item, [r['id'] for r in store.catalog(self.db)])
+                self.assertEqual(store.read(self.db, keep)['content'], '单独保留')
+
     def test_aru_card_workflow_rejects_stale_and_misspelled_edits(self):
         from concurrent.futures import ThreadPoolExecutor
         from threading import Barrier
@@ -251,6 +289,14 @@ class Materials(unittest.TestCase):
             recalled = search.recall(self.settings, q)
             self.assertEqual(recalled['titles'], 2)
             self.assertIn('Serein MCP 的 openMemorySource(id)', recalled['context'])
+
+        def delete_during_rerank(q, docs):
+            store.delete(self.db, ref, 1)
+            return rerank(q, docs)
+        with patch.object(search, 'models', return_value=('profile', Embed(), delete_during_rerank)):
+            recalled = search.recall(self.settings, q)
+            self.assertEqual((recalled['titles'], recalled['count']), (1, 0))
+            self.assertNotIn(ref, recalled['context'])
 
 if __name__=='__main__':
     unittest.main()

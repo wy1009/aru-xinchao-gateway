@@ -1,6 +1,6 @@
 """Serein HTTP and MCP entry points sharing one canonical read/write implementation."""
 from typing import Any, Literal
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import store
@@ -26,8 +26,11 @@ class New(Payload):
     request_id: str
 
 
-class Change(Payload):
+class ExpectedRevision(Payload):
     expected_revision: int = Field(ge=1)
+
+
+class Change(ExpectedRevision):
     title: str | None = None
     content: str | None = None
     old_text: str | None = None
@@ -71,6 +74,13 @@ def routes(settings, auth):
     @router.patch('/materials/{identifier}')
     def update(identifier: str, data: Change):
         return change(settings,identifier,data)
+
+    @router.delete('/materials/{identifier}')
+    def remove(identifier: str, data: ExpectedRevision):
+        try:
+            return store.delete(settings.database, identifier, data.expected_revision)
+        except store.RevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post('/source')
     def source(data: Source):

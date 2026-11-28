@@ -18,13 +18,25 @@ CREATE TABLE IF NOT EXISTS companion_material_origin(
  id TEXT PRIMARY KEY, summary TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS companion_material_source(
  id TEXT NOT NULL, raw_id INTEGER NOT NULL, event_hash TEXT NOT NULL, PRIMARY KEY(id,raw_id));
+CREATE TABLE IF NOT EXISTS companion_removed_import(source_id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS companion_search_vector(
  id TEXT NOT NULL, stamp TEXT NOT NULL, profile TEXT NOT NULL, part INTEGER NOT NULL,
  embedding BLOB NOT NULL, PRIMARY KEY(id,stamp,profile,part));
+CREATE TRIGGER IF NOT EXISTS companion_vector_requires_current_material
+BEFORE INSERT ON companion_search_vector
+WHEN (NEW.id GLOB 'card-*' OR NEW.id GLOB 'ref-*')
+ AND NOT EXISTS (SELECT 1 FROM companion_material WHERE id=NEW.id AND revision=NEW.stamp)
+BEGIN SELECT RAISE(IGNORE); END;
 """
 
 class SourceUnavailable(ValueError):
     """The selected source is missing, withdrawn or no longer readable."""
+
+class RemovedImport(ValueError):
+    """A previously imported material was explicitly deleted."""
+
+class RevisionConflict(ValueError):
+    """The selected material has changed since it was opened."""
 
 
 @contextmanager
@@ -92,6 +104,8 @@ def create(path, kind, title, content, key=None, *, source_id=None, summary=None
         raise ValueError("新建资料需要一个稳定的请求标识，重试时请沿用")
     with connect(path, write=True) as db:
         db.execute('BEGIN IMMEDIATE')
+        if source_id and db.execute('SELECT 1 FROM companion_removed_import WHERE source_id=?', (source_id,)).fetchone():
+            raise RemovedImport('这份迁入资料已删除')
         prior = db.execute('SELECT id,initial_hash FROM companion_material WHERE create_key=?', (key,)).fetchone()
         if prior and prior['initial_hash'] != initial:
             raise ValueError("这个请求标识已经用于另一份内容")
@@ -139,6 +153,22 @@ def update(path, identifier, revision, *, title=None, content=None, old_text=Non
             db.execute('DELETE FROM companion_search_vector WHERE id=?', (identifier,))
             revision += 1
         return {'id': identifier, 'kind': row['kind'], 'title': title, 'revision': revision}
+
+
+def delete(path, identifier, revision):
+    with connect(path, write=True) as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT revision,source_id FROM companion_material WHERE id=?', (identifier,)).fetchone()
+        if row is None:
+            return {'id': identifier, 'deleted': False}
+        if row['revision'] != revision:
+            raise RevisionConflict('这份资料已更新。请重新点开标题，核对最新内容后再删除。')
+        if row['source_id']:
+            db.execute('INSERT INTO companion_removed_import VALUES (?)', (row['source_id'],))
+        for table in ('companion_material_source', 'companion_material_origin', 'companion_material_summary',
+                      'companion_search_vector', 'companion_material'):
+            db.execute(f'DELETE FROM {table} WHERE id=?', (identifier,))
+        return {'id': identifier, 'deleted': True}
 
 
 def passages(body, size=1000):

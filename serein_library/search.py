@@ -9,7 +9,7 @@ from functools import lru_cache
 from itertools import islice
 from threading import Lock
 
-from .store import CATEGORIES, catalog, connect, passages, read, sources
+from .store import CATEGORIES, SourceUnavailable, catalog, connect, passages, read, sources
 
 KINDS = (*CATEGORIES, '事件', '原文')
 STRONG_RELEVANCE = 0.5
@@ -157,7 +157,10 @@ def search(settings, query, *, kinds=KINDS, limit=10, automatic=False):
                 documents.append({'ref':k,'title':title,'body':body})
                 if kind == '信息卡' and k[0] not in seen_cards:
                     seen_cards.add(k[0])
-                    full = read(path,k[0])['content']
+                    try:
+                        full = read(path,k[0])['content']
+                    except SourceUnavailable:
+                        continue
                     if full != body and len(full) <= 3000:
                         documents.append({'ref':k,'title':title,'body':full})
             scores = rerank(query,documents)
@@ -192,7 +195,10 @@ def search(settings, query, *, kinds=KINDS, limit=10, automatic=False):
         item = {'id':identifier,'kind':kind,'title':title,'passage':body,'part':n+1,
                 'matched_by':pool[k]['via'],'relevance':scores.get(k)}
         if kind in CATEGORIES:
-            doc = read(path,identifier)
+            try:
+                doc = read(path,identifier)
+            except SourceUnavailable:
+                continue
             if str(doc['revision']) != stamp:
                 continue
             item['revision'] = doc['revision']
@@ -206,15 +212,17 @@ def search(settings, query, *, kinds=KINDS, limit=10, automatic=False):
 
 
 def recall(settings, query):
-    directory = catalog(settings.database)
     hits = search(settings,query,kinds=CATEGORIES,limit=2,automatic=True)
+    directory = catalog(settings.database)
+    current = {d['id']: d['revision'] for d in directory}
+    items = [r for r in hits['items'] if current.get(r['id']) == r['revision']]
     lines = ['[Serein 资料目录 · 标题与 ID；用 Serein MCP 的 openMemorySource(id) 读全文；更新时沿用返回的 cardId 或 reference]']
     lines.extend(json.dumps({k:d[k] for k in ('kind','title','id')},ensure_ascii=False) for d in directory)
     lines.append('[/Serein 资料目录]')
-    if hits['items']:
+    if items:
         lines.append('[Serein 命中资料 · 历史资料，仅在相关时参考]')
-        for r in hits['items']:
+        for r in items:
             lines.append(json.dumps({k:r[k] for k in ('id','kind','title','revision','passage')},ensure_ascii=False))
         lines.append('[/Serein 命中资料]')
-    return {'context':'\n'.join(lines) if directory else '', 'count':len(hits['items']),
+    return {'context':'\n'.join(lines) if directory else '', 'count':len(items),
             'titles':len(directory),'warnings':hits['warnings']}

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { MarkdownProjection } from "../components/MarkdownProjection.jsx";
 import "./library.css";
 
 const categories = ["信息卡", "长期资料"];
@@ -26,6 +27,7 @@ export function LibraryPage() {
   const [notice, setNotice] = useState("");
   const pending = useRef(0);
   const heading = useRef(null);
+  const searchInput = useRef(null);
   useEffect(() => {
     let active = true;
     request("materials").then(data => { if (active) setCatalog(data.items); })
@@ -89,11 +91,25 @@ export function LibraryPage() {
     } catch (err) { setNotice(err.message); }
     finally { setBusy(false); }
   }
+  async function remove() {
+    if (!window.confirm(`删除${doc.kind}「${doc.title}」？删除后，资料目录、搜索和自动召回都会移除这份资料。`)) return;
+    setBusy(true); setNotice("");
+    try {
+      const result = await request("materials/" + doc.id, "DELETE", { expected_revision: doc.revision });
+      const remaining = items => items.filter(item => item.id !== doc.id);
+      setCatalog(remaining);
+      setResults(items => items === null ? null : remaining(items));
+      setDoc(null);
+      setNotice(result.deleted ? `已删除${doc.kind}「${doc.title}」` : "这份资料已被删除。");
+      searchInput.current?.focus();
+    } catch (err) { setNotice(err.message); }
+    finally { setBusy(false); }
+  }
   const shown = results ?? catalog.filter(item => item.kind === group);
   return <div className="library-page">
     <header><h1>资料</h1></header>
     <form className="library-search" onSubmit={lookup}>
-      <input aria-label="搜索事件、原文和资料" placeholder="搜索事件、原文和资料" value={query}
+      <input ref={searchInput} aria-label="搜索事件、原文和资料" placeholder="搜索事件、原文和资料" value={query}
         onChange={e => setQuery(e.target.value)} />
       <select aria-label="搜索范围" value={scope} onChange={e => setScope(e.target.value)}>
         <option value="">全部类型</option>{[...categories,"事件","原文"].map(k => <option key={k}>{k}</option>)}
@@ -119,10 +135,18 @@ export function LibraryPage() {
         <label>正文<textarea aria-label="正文" required rows={16} value={draft.content}
           onChange={e => setDraft({...draft,content:e.target.value})}/></label>
         <button disabled={busy}>保存</button> <button type="button" disabled={busy} onClick={leaveEditor}>取消</button>
-      </form> : doc && <><small>{doc.kind}{doc.revision && ' · 版本 '+doc.revision}</small>
-        <h2 ref={heading} tabIndex={-1}>{doc.title}</h2>
-        {categories.includes(doc.kind) && <button disabled={busy} onClick={() => setDraft({...doc})}>编辑</button>}
-        <div className="library-body">{doc.content}</div></>}
+      </form> : doc && <><header className="library-reader-header">
+        <div><small>{doc.kind}{doc.revision && ' · 版本 '+doc.revision}</small>
+          <h2 ref={heading} tabIndex={-1}>{doc.title}</h2></div>
+        {categories.includes(doc.kind) && <div className="library-actions">
+          <button disabled={busy} onClick={() => setDraft({...doc})}>编辑</button>
+          <button className="library-delete" disabled={busy} onClick={remove}>删除</button>
+        </div>}
+      </header>
+        {doc.kind === "原文"
+          ? <div className="library-body library-original">{doc.content}</div>
+          : <MarkdownProjection className="library-body" content={doc.content}/>}
+      </>}
     </article></div>
   </div>;
 }

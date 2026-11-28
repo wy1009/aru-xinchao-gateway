@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import pwd
 
-from serein_library.store import create, read, setup, connect
+from serein_library.store import RemovedImport, SourceUnavailable, create, read, setup, connect
 
 def migrate():
     from curated_pages import read_sources, MCPClient
@@ -39,20 +39,28 @@ def migrate():
     os.setuid(user.pw_uid)
     path = '/var/lib/gushou-serein/serein.db'
     setup(path)
+    counts = {'信息卡': 0, '长期资料': 0}
     for source_id,kind,title,body,summary,evidence in docs:
         with connect(path) as db:
             prior = db.execute('SELECT id FROM companion_material WHERE source_id=?',(source_id,)).fetchone()
-        identifier = prior[0] if prior else create(path,kind,title,body,'seed:'+source_id,source_id=source_id)
-        saved = read(path,identifier)
+        try:
+            identifier = prior[0] if prior else create(path,kind,title,body,'seed:'+source_id,source_id=source_id)
+            saved = read(path,identifier)
+        except (RemovedImport, SourceUnavailable):
+            continue
         if saved['revision']==1 and (title,body)!=(saved['title'],saved['content']):
             raise ValueError('Full text verification failed')
         with connect(path,write=True) as db:
+            db.execute('BEGIN IMMEDIATE')
+            if not db.execute('SELECT 1 FROM companion_material WHERE id=?', (identifier,)).fetchone():
+                continue
             db.execute('INSERT OR IGNORE INTO companion_material_origin VALUES(?,?)',(identifier,summary))
             for _,_,mid in evidence:
                 db.execute("""INSERT OR IGNORE INTO companion_material_source SELECT ?,r.id,r.event_hash
                     FROM raw_events r JOIN aru_scope a ON a.session=r.session_id AND a.allowed=1
                     WHERE source='aru' AND source_event_id=?""",(identifier,mid))
-    print(json.dumps({k:sum(d[1]==k for d in docs) for k in ('信息卡','长期资料')},ensure_ascii=False))
+        counts[kind] += 1
+    print(json.dumps(counts,ensure_ascii=False))
 
 if __name__ == '__main__':
     migrate()

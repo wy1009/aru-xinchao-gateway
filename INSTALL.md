@@ -54,7 +54,7 @@ CREATE INDEX IF NOT EXISTS audit_by_time ON audit(at);
 
 ## 顾守的 Serein 资料与统一搜索
 
-这套扩展共用 Serein 的数据库、鉴权、向量模型和重排模型。「资料」页在 `/__serein/#materials`。聊天网关分别查询原生事件和资料，目录包含资料类型、标题及稳定 ID。通过重排的卡片附全文，长期资料附最相关的一段。MCP 的 `search_library` 同时搜索事件、原文、信息卡及长期资料。原话范围来自当前备份许可的会话。
+这套扩展共用 Serein 的数据库、鉴权、向量模型和重排模型。「资料」页在 `/__serein/#materials`。打开信息卡或长期资料即可阅读 Markdown 正文、编辑或删除。确认删除后，资料从目录、搜索和自动召回中移除。聊天网关分别查询原生事件和资料，目录包含资料类型、标题及稳定 ID。通过重排的卡片附全文，长期资料附最相关的一段。MCP 的 `search_library` 同时搜索事件、原文、信息卡及长期资料。原话范围来自当前备份许可的会话。
 
 在 Serein `fdab5a8` 源码根目录应用 `scripts/serein-library.patch`，将本仓库的 `serein_library/` 放到服务的 Python 路径（顾守实例为 `/opt/gushou-serein/`），将其中 `web/LibraryPage.jsx`、`web/library.css` 复制到前端的 `src/pages/` 并按原站路径重新构建。已安装 wheel 的实例也需要更新实际加载的 `serein/api/http.py`、`serein/api/mcp.py`。Web 网关沿用实例的 Aru 登录和原有域名校验。
 
