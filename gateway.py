@@ -19,6 +19,7 @@ import httpx
 from anyio import CancelScope
 from prompt_audit import log_emotion, log_request, log_reply
 from usage_ledger import UsageCall
+import aru_mcp_arguments
 import hindsight_gateway as hindsight
 import serein_gateway as serein
 from starlette.applications import Starlette
@@ -581,12 +582,15 @@ class OrganizerResult(VisibleChoices):
             )
 
 
-async def relay(upstream, completed, audit=None, meter=None):
+async def relay(upstream, completed, audit=None, meter=None, *, fix_mcp=False, choices=1):
     # OpenAI SSE events are UTF-8. Preserve their fields, including usage and tool-call deltas.
     data = []
     done = False
     try:
-        async for line in upstream.aiter_lines():
+        lines = upstream.aiter_lines()
+        if fix_mcp:
+            lines = aru_mcp_arguments.stream_lines(lines, choices)
+        async for line in lines:
             if line.startswith("data:"):
                 data.append(line[5:].lstrip(" "))
             if not line and data:
@@ -746,11 +750,13 @@ async def chat(req: Request, *, organizer=False):
             audit = ReplyAudit(directory, record_id)
     meter = UsageCall(DB.parent / "prompt-audit", "organizer" if organizer else "chat",
                       CHAT, MODEL, body.get("n") or 1) if upstream.is_success else None
+    fix_mcp = (not organizer and MODEL == "deepseek-ai/DeepSeek-V3.2"
+               and aru_mcp_arguments.advertised(body))
     if upstream.is_success and upstream.headers.get("content-type", "").startswith(
         "text/event-stream"
     ):
         return StreamingResponse(
-            relay(upstream, completed, audit, meter),
+            relay(upstream, completed, audit, meter, fix_mcp=fix_mcp, choices=body.get("n") or 1),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
@@ -758,6 +764,8 @@ async def chat(req: Request, *, organizer=False):
         raw = await upstream.aread()
         if upstream.is_success:
             chunk = json.loads(raw)
+            if fix_mcp and aru_mcp_arguments.repair([chunk], "message"):
+                raw = json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode()
             meter.observe(chunk)
             if audit is not None:
                 audit.accept(chunk, False)
