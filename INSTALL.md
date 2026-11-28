@@ -101,3 +101,10 @@ journalctl -u gushou-serein-sync.service -n 12
 在网关的环境变量 `NIAN_ARU_MCP_CATALOG` 中指定一个服务进程可读的本地 JSON 文件。文件是服务数组，每项有 `server`（Aru 中的服务显示名）、`count`（当前开放的方法数）和 `tools`。每个工具的 `alias` 取自 Aru 目录返回的完整 `tool` 值，`function` 包含带服务前缀的唯一函数名、描述及真实的 JSON Schema（`parameters`）。调用标识属于该客户端配置，请保留在部署主机。更换服务、工具权限或参数定义后，应重新核对目录并重载网关。
 
 顾守保留 `listMCPTools` 和 `readMCPTool`。查看某个服务的目录后，下一次模型请求会带上该服务的方法定义。网关把模型返回的普通函数调用转换为 Aru 的 `invokeMCPTool`，保留调用 ID，由客户端校验参数、权限并执行。缺少对应定义或上游明确拒绝工具数量、上下文长度时，可继续走客户端已有的入口。
+
+### DeepSeek V3.2 的 DSML 工具参数错误
+
+Aru 报 `invokeMCPTool.invalid_arguments`、`expected: object` 时，先看操作记录里的内层 `arguments`。如果它是以 `<｜DSML｜parameter` 开头的字符串，就对应这里处理的情况。
+
+- **优先让模型直接调用普通函数。** 例如模型选择 `serein_search_library`，只需生成 `{"query":"天气"}`。网关根据本机目录补上 Aru 的工具标识，把调用还原为 `invokeMCPTool`，沿用模型返回的调用 ID。移植时，请从自己的 Aru 目录取 `tool` 标识，从对应 MCP 方法的 `inputSchema` 取参数定义，按上一节设置 `NIAN_ARU_MCP_CATALOG`。[请求转换和响应还原](aru_native_tools.py) · [聊天网关接入](gateway.py) · [测试](test_aru_native_tools.py)
+- **兼容仍经过旧入口的调用。** `corrected_arguments` 能从已知的 DSML 形式还原`search_library` 的查询词、`openMemorySource` 的来源 ID，以及 `list_materials` 把自身标识重复写进参数时对应的空对象 `{}`。如果搜索词已经丢失，仍交给 Aru 校验报错。普通 JSON 和流式 SSE 都有对应测试。[参数修复](aru_mcp_arguments.py) · [错误样例和流式测试](test_aru_mcp_arguments.py)
