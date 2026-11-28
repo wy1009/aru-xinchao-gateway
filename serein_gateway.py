@@ -78,7 +78,7 @@ def source_window(messages, index, as_text):
     return result
 
 
-def window(messages, index, as_text):
+def window(messages, index, as_text, limit=8):
     """Recent visible turns for original-exchange deduplication and legacy live capture."""
     if index is None:
         return []
@@ -96,7 +96,7 @@ def window(messages, index, as_text):
         text = as_text(m.get("content"))
         if eligible(text):
             recent.append({"role":m["role"],"text":text,"mid":message_id(m)})
-        if len(recent) == 8:
+        if len(recent) == limit:
             break
     return list(reversed(recent))
 

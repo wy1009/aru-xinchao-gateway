@@ -85,9 +85,15 @@ def split_context(text):
         if isinstance(value, list) and value and isinstance(value[0], dict):
             parts = value
     first = parts[0].get("text") if parts else text
-    if not isinstance(first, str) or not first.startswith(CONTEXT_PREFIX):
+    if not isinstance(first, str):
         return "", text
-    context, end, message = first[len(CONTEXT_PREFIX):].partition(CONTEXT_END)
+    if first.startswith("<hindsight_memories>\n"):
+        prefix, suffix = "<hindsight_memories>\n", "\n</hindsight_memories>\n\n"
+    elif first.startswith(CONTEXT_PREFIX):
+        prefix, suffix = CONTEXT_PREFIX, CONTEXT_END
+    else:
+        return "", text
+    context, end, message = first[len(prefix):].partition(suffix)
     if not end:
         return "", text
     if parts:
@@ -132,7 +138,7 @@ def compact_log(record_id):
     if context:
         chunks.append("<pre>" + escape(context) + "</pre>")
     else:
-        chunks.append("<p>这次请求没有附加 Serein 记忆。</p>")
+        chunks.append("<p>这次请求没有附加记忆。</p>")
     chunks.append("<h2>最近的聊天消息</h2>")
     for role, kind, text in dialogue[-COMPACT_LIMIT:]:
         speaker = "你" if role == "user" else "顾守"

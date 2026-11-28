@@ -19,6 +19,7 @@ import httpx
 from anyio import CancelScope
 from prompt_audit import log_emotion, log_request, log_reply
 from usage_ledger import UsageCall
+import hindsight_gateway as hindsight
 import serein_gateway as serein
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -668,14 +669,15 @@ async def chat(req: Request, *, organizer=False):
         if body.get("metadata") is not None and not isinstance(body["metadata"], dict):
             raise ValueError
         changes = {}
-        if serein.ENABLED and serein.LIVE_CAPTURE and not organizer:
+        use_serein = serein.ENABLED and not hindsight.ENABLED
+        if use_serein and serein.LIVE_CAPTURE and not organizer:
             changes = serein.source_changes(messages, body.get("metadata"), as_text)
             if changes["deleted"]:
                 deleted = set(changes["deleted"])
                 messages = [m for m in messages if serein.message_id(m) not in deleted]
                 body = {**body, "messages": messages}
         turn = None
-        if not organizer and (MIND_ENABLED or CHAT_MEMORY_IMPORT or serein.ENABLED):
+        if not organizer and (MIND_ENABLED or CHAT_MEMORY_IMPORT or use_serein):
             turn = turn_identity(req, body, messages)
     except (ValueError, TypeError, KeyError):
         return failure(400, "A valid chat messages array is required.")
@@ -685,7 +687,12 @@ async def chat(req: Request, *, organizer=False):
     db = req.app.state.db
     state_index = None
     user_index = turn[2] if turn else last_user_index(messages)
-    recent = serein.window(messages, user_index, as_text) if serein.ENABLED and turn else []
+    recall_query = None
+    if hindsight.ENABLED and not organizer:
+        current = serein.window(messages, user_index, as_text, limit=1)
+        if current:
+            recall_query = serein.query_text(current)
+    recent = serein.window(messages, user_index, as_text) if use_serein and turn else []
     source_window = serein.source_window(messages, user_index, as_text) if recent and serein.LIVE_CAPTURE else []
     if MIND_ENABLED and turn and MIND_STATE_MODE != "0":
         state_index = await add_state(messages, turn, window_key(messages, turn))
@@ -697,7 +704,12 @@ async def chat(req: Request, *, organizer=False):
     completed = OrganizerResult(db, body) if organizer else Completion(db, turn, body)
     client = req.app.state.client
     recall_status = "本轮未发起检索"
-    if recent:
+    if recall_query is not None:
+        memories, recall_status = await hindsight.recall(client, recall_query)
+        if memories:
+            messages = hindsight.inject(messages, memories, user_index)
+            body = {**body, "messages": messages}
+    elif recent:
         original_ready = True
         if serein.LIVE_CAPTURE:
             completed.serein_record = {"turn":turn[0],"session":turn[1],"turns":recent,"stamp":int(time.time()*1000),
@@ -710,7 +722,8 @@ async def chat(req: Request, *, organizer=False):
                 body = {**body, "messages": messages}
         else:
             recall_status = "原话待确认，本轮未检索"
-    audit_suffix = " · Serein " + recall_status if serein.ENABLED else ""
+    provider = "Hindsight" if hindsight.ENABLED else ("Serein" if use_serein else "")
+    audit_suffix = f" · {provider} {recall_status}" if provider else ""
     sent_at = time.time()
     try:
         upstream = await client.send(
@@ -1274,7 +1287,7 @@ async def lifespan(app):
     ) as client:
         app.state.client = client
         tasks = []
-        if serein.ENABLED and serein.LIVE_CAPTURE:
+        if serein.ENABLED and not hindsight.ENABLED and serein.LIVE_CAPTURE:
             serein.setup(db)
             tasks.append(asyncio.create_task(serein.worker(app)))
         if MIND_ENABLED:

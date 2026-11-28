@@ -52,7 +52,11 @@ CREATE INDEX IF NOT EXISTS audit_by_time ON audit(at);
 
 在上传服务的应用目录部署 `aru_archive_upload.py` 和 `aru_archive_upload.html`。访问 `/aru-backup/archive/`，使用原站的 Aru 认证上传完整备份。页面支持 4 MiB 分块校验和续传，文件保存在该服务私有状态目录的 `archive-uploads/<清单摘要>/archive.polarisarchive` 中，等待核对。
 
-## 顾守的 Serein 试用实例
+## 顾守的 Hindsight 观察召回
+
+将 `hindsight_gateway.py` 随网关部署，把 `systemd/96-hindsight.conf` 安装到 `nian-gateway.service.d/`，重载 systemd 并重启网关。服务凭据来自本机 Hindsight 的 `/etc/gushou-hindsight/local-key`。顾守入口以最新一条用户消息查询 `gushou` 库的观察，沿用 OpenClaw 的提示文本和 1,024 token 预算。召回简报会显示实际注入的观察与条数。停用旧接入时，同时停用 Serein 服务、同步定时器及其整理任务。
+
+## 旧版 Serein 试用配置
 
 Serein 上游仓库为 `https://github.com/Yinglianchun/Serein`，使用提交 `fdab5a8af8c966572c47faabed18223079bc91c4`。
 `nian-gateway` 从 `serein_gateway.py` 调用本机的 `gushou-serein`（18118）和
