@@ -122,7 +122,7 @@ async def hook_cards(client, query, session):
     return result
 
 
-async def recall(client, turns, session):
+async def event_recall(client, turns, session):
     query = query_text(turns)
     if not query:
         return "", "当前消息没有可检索的文字"
@@ -158,6 +158,37 @@ async def recall(client, turns, session):
     except (httpx.HTTPError, OSError, ValueError, KeyError) as exc:
         log.warning("Serein recall unavailable (%s)", type(exc).__name__)
         return "", f"{stage}失败（{type(exc).__name__}）"
+
+async def material_recall(client, query):
+    try:
+        response = await client.post(API + "/v1/library/recall", headers=headers(), timeout=18,
+                                     json={"query":query})
+        response.raise_for_status()
+        data = response.json()
+        status = f"资料命中 {data['count']} 份 · 目录 {data['titles']} 项"
+        return data["context"], " · ".join([status, *data.get("warnings", [])])
+    except (httpx.HTTPError, OSError, ValueError, KeyError) as exc:
+        log.warning("Serein material recall unavailable (%s)", type(exc).__name__)
+        try:
+            res = await client.get(API + "/v1/library/materials",headers=headers(),timeout=2)
+            res.raise_for_status()
+            items = res.json()["items"]
+            context = "[Serein 资料目录 · 可用 read_material(id) 读全文]\n" + "\n".join(
+                json.dumps(row,ensure_ascii=False) for row in items) + "\n[/Serein 资料目录]"
+            return context, f"资料检索失败 · 目录 {len(items)} 项"
+        except (httpx.HTTPError, OSError, ValueError, KeyError):
+            return "", "资料检索与目录暂不可用"
+
+
+async def recall(client, turns, session):
+    query = query_text(turns)
+    if not query or os.environ.get("NIAN_SEREIN_MATERIALS") != "1":
+        return await event_recall(client, turns, session)
+    events, materials = await asyncio.gather(event_recall(client, turns, session),
+                                             material_recall(client, query))
+    return ("\n\n".join(part for part in (events[0], materials[0]) if part),
+            " · ".join((events[1], materials[1])))
+
 
 def inject(messages, context, index):
     """Use examples/hook_host.py's model-facing envelope on the outbound copy."""

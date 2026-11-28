@@ -52,7 +52,17 @@ CREATE INDEX IF NOT EXISTS audit_by_time ON audit(at);
 
 在上传服务的应用目录部署 `aru_archive_upload.py` 和 `aru_archive_upload.html`。访问 `/aru-backup/archive/`，使用原站的 Aru 认证上传完整备份。页面支持 4 MiB 分块校验和续传，文件保存在该服务私有状态目录的 `archive-uploads/<清单摘要>/archive.polarisarchive` 中，等待核对。
 
-## 顾守的 Hindsight 观察召回
+## 顾守的 Serein 资料与统一搜索
+
+这套扩展共用 Serein 的数据库、鉴权、向量模型和重排模型。「资料」页在 `/__serein/#materials`。聊天网关分别查询原生事件和资料，目录包含资料类型、标题及稳定 ID。通过重排的卡片附全文，长期资料附最相关的一段。MCP 的 `search_library` 同时搜索事件、原文、信息卡及长期资料。原话范围来自当前备份许可的会话。
+
+在 Serein `fdab5a8` 源码根目录应用 `scripts/serein-library.patch`，将本仓库的 `serein_library/` 放到服务的 Python 路径（顾守实例为 `/opt/gushou-serein/`），将其中 `web/LibraryPage.jsx`、`web/library.css` 复制到前端的 `src/pages/` 并按原站路径重新构建。已安装 wheel 的实例也需要更新实际加载的 `serein/api/http.py`、`serein/api/mcp.py`。Web 网关沿用实例的 Aru 登录和原有域名校验。
+
+`systemd/gushou-serein-library.conf` 放在 Serein 服务的 drop-in 目录。以该服务的用户和模型环境运行 `python -m serein_library.prepare --config /etc/gushou-serein/config.toml` 可初始化资料表并续建索引。查询也会补齐新增或修订内容的索引，读取结果按当前版本复核。`scripts/serein-import-materials.py` 仅用于从已有 Aru/Hindsight 部署一次性核对并迁入顾守编写的资料。使用历史部署的 `curated_pages` 读取当初入库所用的备份。运行时资料读写、搜索和注入都在 Serein 中完成。
+
+将本仓库的 `serein_gateway.py` 和 `systemd/98-serein-library.conf` 部署到聊天网关，并启用 Serein、证据桥和管理页服务。顾守的 MCP 入口为 `/serein/mcp`。旧部署使用 `scripts/serein-mcp-alias.py` 可让已经配好的 `/hindsight/mcp` 使用相同的 Aru 登录连接 Serein。新资料使用 `create_material`，修改已有资料先 `read_material` 读取全文和版本，再调用 `update_material`。整份替换和唯一原段落替换都检查版本。
+
+## 旧版 Hindsight 观察召回
 
 将 `hindsight_gateway.py` 随网关部署，把 `systemd/96-hindsight.conf` 安装到 `nian-gateway.service.d/`，重载 systemd 并重启网关。服务凭据来自本机 Hindsight 的 `/etc/gushou-hindsight/local-key`。顾守入口以最新一条用户消息查询 `gushou` 库的观察，沿用 OpenClaw 的提示文本和 1,024 token 预算。召回简报会显示实际注入的观察与条数。停用旧接入时，同时停用 Serein 服务、同步定时器及其整理任务。
 

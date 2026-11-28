@@ -1,0 +1,118 @@
+--- a/src/serein/api/mcp.py
++++ b/src/serein/api/mcp.py
+@@ -286,6 +286,9 @@
+         if not app.settings.writable:raise ValueError('Private live MCP requires writable storage')
+         from .private_mcp import add_tools
+         add_tools(server,app.settings)
++    if not private and app.settings.writable and os.environ.get("SEREIN_COMPANION_LIBRARY") == "1":
++        from serein_library.api import register
++        register(server, app.settings)
+     if app.settings.mcp_tools is not None:
+         available = {tool.name for tool in server._tool_manager.list_tools()}
+         selected = set(app.settings.mcp_tools)
+--- a/src/serein/api/http.py
++++ b/src/serein/api/http.py
+@@ -178,6 +178,9 @@
+         return {'status':'ok'}
+ 
+     auth = [Depends(authorize)]
++    if live and os.environ.get("SEREIN_COMPANION_LIBRARY") == "1":
++        from serein_library.api import routes as library_routes
++        app.include_router(library_routes(settings, auth))
+     from .appearance import routes as appearance_routes
+     app.include_router(appearance_routes(settings, auth))
+     from .export import routes as export_routes
+--- a/web/src/App.jsx
++++ b/web/src/App.jsx
+@@ -1,3 +1,4 @@
++import { LibraryPage } from "./pages/LibraryPage.jsx";
+ import { EventMailboxPage } from "./pages/EventMailboxPage.jsx";
+ import { useCallback, useEffect, useRef, useState } from "react";
+ import { UsageGuide } from "./components/UsageGuide.jsx";
+@@ -12,8 +13,9 @@
+ import { PersonaPage, MemosPage } from "./pages/CompanionPages.jsx";
+ import { ResumePage } from "./pages/ResumePage.jsx";
+ 
+-const availableAreas = new Set(["沉淀", "醒来", "记忆", "叙事卷", "日记", "地下室", "花园", "设置", "心绪", "备忘", "使用说明", "换窗"]);
++const availableAreas = new Set(["资料", "沉淀", "醒来", "记忆", "叙事卷", "日记", "地下室", "花园", "设置", "心绪", "备忘", "使用说明", "换窗"]);
+ const areaHashes = {
++  资料: "#materials",
+   沉淀: "#mailbox",
+   心绪: "#persona",
+   备忘: "#memos",
+@@ -29,6 +31,7 @@
+ };
+ 
+ const readAreaFromHash = () => {
++  if (window.location.hash === "#materials") return "资料";
+   if (window.location.hash === "#mailbox") return "沉淀";
+   if (window.location.hash === "#resume") return "换窗";
+   if (window.location.hash === "#persona") return "心绪";
+@@ -137,7 +140,7 @@
+                 ? "diary"
+                 : activeArea === "地下室"
+                   ? "basement"
+-                  : activeArea === "沉淀" ? "mailbox" : activeArea === "换窗" ? "resume" : ["设置", "使用说明"].includes(activeArea) ? "settings" : ["心绪", "备忘"].includes(activeArea) ? "companion" : "garden"
++                  : activeArea === "沉淀" ? "mailbox" : activeArea === "换窗" ? "resume" : ["设置", "使用说明"].includes(activeArea) ? "settings" : ["心绪", "备忘", "资料"].includes(activeArea) ? "companion" : "garden"
+       }`}
+     >
+       <AwakePage
+@@ -213,6 +216,10 @@
+         />
+       </section>
+ 
++      {activeArea === "资料" && <section className="companion-page" aria-label="资料">
++        <LibraryPage />
++        <Sidebar activeArea={activeArea} onNavigate={navigateTo} onOpenSettings={() => setSettingsOpen(true)} />
++      </section>}
+       {["心绪", "备忘"].includes(activeArea) && <section className="companion-page" aria-label={activeArea}>
+         {activeArea === "心绪" ? <PersonaPage /> : <MemosPage />}
+         <Sidebar activeArea={activeArea} onNavigate={navigateTo} onOpenSettings={() => setSettingsOpen(true)} />
+--- a/web/src/components/Sidebar.jsx
++++ b/web/src/components/Sidebar.jsx
+@@ -29,6 +29,7 @@
+ const navItems = [
+   { label: "醒来", icon: House },
+   { label: "记忆", icon: Sparkle },
++  { label: "资料", icon: Books },
+   { label: "沉淀", icon: CheckSquare },
+   { label: "叙事卷", icon: Books },
+   { label: "日记", icon: BookOpenText },
+--- a/web/server/gateway.mjs
++++ b/web/server/gateway.mjs
+@@ -51,6 +51,8 @@
+     res.end('{"detail":"OAuth requires a configured HTTPS public origin"}');return;
+   }
+   const chat = bearerPaths.has(path) || mcp;
++  const mcpBasic = mcp && /^Basic /i.test(req.headers.authorization || '');
++  if (mcpBasic && !requireWebAuth(req, res, filename)) return;
+   if (mcp && req.headers.origin) {
+     let originOK = false;
+     try { originOK = new URL(req.headers.origin).host === req.headers.host; } catch {}
+@@ -96,9 +98,16 @@
+   if (chat && !mcp && !req.headers.authorization?.startsWith('Bearer ')) {
+     res.writeHead(401); res.end('Bearer token required'); return;
+   }
+-  const backend = chat || oauth;
++  // The browser uses the existing Aru login. Only these library routes receive the private core credential.
++  const libraryPrefix = '/__serein/library-api/';
++  const library = path.startsWith(libraryPrefix) && /^(materials(\/(card|ref)-[0-9a-f]{16})?|search|source)$/.test(path.slice(libraryPrefix.length));
++  const backend = chat || oauth || library;
+   const target = backend ? core : new URL(`http://127.0.0.1:${process.env.SEREIN_PREVIEW_PORT || 4173}`);
+   const headers = { ...req.headers, host: backend ? target.host : req.headers.host };
++  if (library || mcpBasic) {
++    headers.authorization = 'Bearer ' + memoryToken();
++    delete headers.cookie;
++  }
+   if (mcp || oauth) {
+     headers['x-forwarded-host'] = publicOrigin?.host || req.headers.host;
+     headers['x-forwarded-proto'] = publicOrigin?.protocol.slice(0,-1) || 'http';
+@@ -106,7 +115,7 @@
+   for (const key of hopHeaders) delete headers[key];
+   if (!backend) delete headers.authorization;
+   const proxy = (target.protocol === 'https:' ? https : http).request(target, {
+-    method: req.method, path: req.url, headers,
++    method: req.method, path: library ? "/v1/library/" + path.slice(libraryPrefix.length) : req.url, headers,
+   }, upstream => {
+     const responseHeaders = { ...upstream.headers };
+     for (const key of hopHeaders) delete responseHeaders[key];
