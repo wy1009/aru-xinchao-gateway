@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS companion_material(
  id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('信息卡','长期资料')),
  title TEXT NOT NULL, content TEXT NOT NULL, revision INTEGER NOT NULL,
  create_key TEXT UNIQUE, initial_hash TEXT, source_id TEXT UNIQUE);
+CREATE TABLE IF NOT EXISTS companion_material_summary(
+ id TEXT PRIMARY KEY, summary TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS companion_material_origin(
  id TEXT PRIMARY KEY, summary TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS companion_material_source(
@@ -51,13 +53,18 @@ def catalog(path):
 
 def read(path, identifier):
     with connect(path) as db:
-        row = db.execute('SELECT id,kind,title,content,revision FROM companion_material WHERE id=?', (identifier,)).fetchone()
+        row = db.execute("""SELECT m.id,m.kind,m.title,m.content,m.revision,
+                coalesce(s.summary,o.summary,'') AS summary,o.summary AS imported_summary
+            FROM companion_material m LEFT JOIN companion_material_summary s ON s.id=m.id
+            LEFT JOIN companion_material_origin o ON o.id=m.id WHERE m.id=?""",(identifier,)).fetchone()
         if row is None:
             raise ValueError("资料 ID 不存在，请重新查看目录")
         result = dict(row)
-        origin = db.execute('SELECT summary FROM companion_material_origin WHERE id=?',(identifier,)).fetchone()
-        if origin:
-            result['imported_summary'] = origin[0]
+        if result['kind'] != '长期资料':
+            result.pop('summary')
+        if result['imported_summary'] is None:
+            result.pop('imported_summary')
+        else:
             result['imported_source_ids'] = [r[0] for r in db.execute("""
                 SELECT 'raw:'||r.id FROM companion_material_source b JOIN raw_events r
                 ON r.id=b.raw_id AND r.event_hash=b.event_hash AND r.source='aru'
@@ -65,11 +72,18 @@ def read(path, identifier):
         return result
 
 
-def create(path, kind, title, content, key, *, source_id=None):
+def create(path, kind, title, content, key=None, *, source_id=None, summary=None):
     validate(kind, title, content)
-    if not key or not key.strip() or len(key) > 150:
+    initial_fields = (kind, title, content)
+    if summary is not None:
+        if kind != '长期资料':
+            raise ValueError('只有长期资料可以填写摘要')
+        initial_fields += (summary,)
+    initial = hashlib.sha256(repr(initial_fields).encode()).hexdigest()
+    if key is None:
+        key = 'aru-mcp:' + initial
+    if not key.strip() or len(key) > 150:
         raise ValueError("新建资料需要一个稳定的请求标识，重试时请沿用")
-    initial = hashlib.sha256(repr((kind,title,content)).encode()).hexdigest()
     with connect(path, write=True) as db:
         db.execute('BEGIN IMMEDIATE')
         prior = db.execute('SELECT id,initial_hash FROM companion_material WHERE create_key=?', (key,)).fetchone()
@@ -81,13 +95,15 @@ def create(path, kind, title, content, key, *, source_id=None):
             identifier = ('card-' if kind == CATEGORIES[0] else 'ref-') + uuid.uuid4().hex[:16]
             db.execute('INSERT INTO companion_material VALUES (?,?,?,?,1,?,?,?)',
                        (identifier, kind, title, content, key, initial, source_id))
+            if summary is not None:
+                db.execute('INSERT INTO companion_material_summary VALUES (?,?)',(identifier,summary))
     return identifier
 
 
-def update(path, identifier, revision, *, title=None, content=None, old_text=None, new_text=None):
+def update(path, identifier, revision, *, title=None, content=None, old_text=None, new_text=None, summary=None):
     if (old_text is None) != (new_text is None) or (old_text is not None and content is not None):
         raise ValueError("请给完整正文，或给一对 old_text、new_text")
-    if title is None and content is None and old_text is None:
+    if title is None and content is None and old_text is None and summary is None:
         raise ValueError("请提供需要修改的内容")
     with connect(path, write=True) as db:
         db.execute('BEGIN IMMEDIATE')
@@ -101,7 +117,17 @@ def update(path, identifier, revision, *, title=None, content=None, old_text=Non
         title = row['title'] if title is None else title
         content = row['content'] if content is None else content
         validate(row['kind'], title, content)
-        if (title, content) != (row['title'], row['content']):
+        summary_changed = False
+        if summary is not None:
+            if row['kind'] != '长期资料':
+                raise ValueError("只有长期资料可以修改摘要")
+            previous = db.execute("""SELECT coalesce(
+                (SELECT summary FROM companion_material_summary WHERE id=?),
+                (SELECT summary FROM companion_material_origin WHERE id=?),'')""",(identifier,identifier)).fetchone()[0]
+            summary_changed = previous != summary
+            if summary_changed:
+                db.execute('INSERT OR REPLACE INTO companion_material_summary VALUES (?,?)',(identifier,summary))
+        if summary_changed or (title, content) != (row['title'], row['content']):
             db.execute('UPDATE companion_material SET title=?,content=?,revision=revision+1 WHERE id=?',
                        (title, content, identifier))
             db.execute('DELETE FROM companion_search_vector WHERE id=?', (identifier,))

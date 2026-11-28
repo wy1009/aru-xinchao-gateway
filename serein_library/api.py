@@ -4,6 +4,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import store
+from .aru_tools import register_aru_tools
 from .search import KINDS, recall, search
 
 Kind = Literal['信息卡','长期资料']
@@ -94,7 +95,7 @@ def routes(settings, auth):
 def register(server, settings):
     from mcp.types import ToolAnnotations
     def list_materials() -> dict[str,Any]:
-        """列出所有信息卡和长期资料的标题、类型及 ID。已有 ID 时直接用 read_material。"""
+        """列出所有信息卡和长期资料的标题、类型及 ID。已有 ID 时直接用 Serein 的 openMemorySource。"""
         return {'items':store.catalog(settings.database)}
 
     def read_material(id: str) -> dict[str,Any]:
@@ -112,10 +113,23 @@ def register(server, settings):
         return new(settings,New(kind=kind,title=title,content=content,request_id=request_id))
 
     def search_library(query: str, kind: SearchKind | None=None, limit: int=10) -> dict[str,Any]:
-        """查过去的事、原话或资料时用此入口；同时用关键词和语义近邻搜索事件、聊天原文、信息卡、长期资料。可省略 kind 查全部。信息卡和长期资料用 read_material(id)，事件用 read_memory(identifier)，原话用 source_message_read(ids) 读全文。"""
+        """查过去的事、原话或资料时用此入口；同时用关键词和语义近邻搜索事件、聊天原文、信息卡、长期资料。可省略 kind 查全部。信息卡和长期资料用 Serein 的 openMemorySource(id)，事件用 read_memory(identifier)，原话用 source_message_read(ids) 读全文。"""
         return find(settings,Query(query=query,kind=kind,limit=limit))
 
     for fn in (list_materials,read_material,search_library,create_material,update_material):
         readonly = fn in (list_materials,read_material,search_library)
         server.add_tool(fn,annotations=ToolAnnotations(readOnlyHint=readonly,destructiveHint=False,
                                                        idempotentHint=fn!=update_material,openWorldHint=False))
+
+    register_aru_tools(server, settings)
+    # Existing callers can finish calls from a cached catalog. Expose one workflow
+    # to new clients, respecting an operator's explicit legacy tool selection.
+    if getattr(settings, 'mcp_tools', None) is None:
+        original_list = server.list_tools
+
+        async def list_current_tools():
+            legacy = {'read_material', 'create_material', 'update_material'}
+            return [t for t in await original_list() if t.name not in legacy]
+
+        server.list_tools = list_current_tools
+        server._setup_handlers()

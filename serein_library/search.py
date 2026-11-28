@@ -207,7 +207,7 @@ def search(settings, query, *, kinds=KINDS, limit=10, automatic=False):
 def recall(settings, query):
     directory = catalog(settings.database)
     hits = search(settings,query,kinds=CATEGORIES,limit=2,automatic=True)
-    lines = ['[Serein 资料目录 · 标题与 ID；可用 read_material(id) 读全文]']
+    lines = ['[Serein 资料目录 · 标题与 ID；用 Serein MCP 的 openMemorySource(id) 读全文；更新时沿用返回的 cardId 或 reference]']
     lines.extend(json.dumps({k:d[k] for k in ('kind','title','id')},ensure_ascii=False) for d in directory)
     lines.append('[/Serein 资料目录]')
     if hits['items']:

@@ -173,8 +173,8 @@ async def material_recall(client, query):
             res = await client.get(API + "/v1/library/materials",headers=headers(),timeout=2)
             res.raise_for_status()
             items = res.json()["items"]
-            context = "[Serein 资料目录 · 可用 read_material(id) 读全文]\n" + "\n".join(
-                json.dumps(row,ensure_ascii=False) for row in items) + "\n[/Serein 资料目录]"
+            context = "[Serein 资料目录 · 用 Serein MCP 的 openMemorySource(id) 读全文；更新时沿用返回的 cardId 或 reference]\n" + "\n".join(
+                json.dumps({k: row[k] for k in ('kind', 'title', 'id')}, ensure_ascii=False) for row in items) + "\n[/Serein 资料目录]"
             return context, f"资料检索失败 · 目录 {len(items)} 项"
         except (httpx.HTTPError, OSError, ValueError, KeyError):
             return "", "资料检索与目录暂不可用"

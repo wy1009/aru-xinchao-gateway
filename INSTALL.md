@@ -60,7 +60,7 @@ CREATE INDEX IF NOT EXISTS audit_by_time ON audit(at);
 
 `systemd/gushou-serein-library.conf` 放在 Serein 服务的 drop-in 目录。以该服务的用户和模型环境运行 `python -m serein_library.prepare --config /etc/gushou-serein/config.toml` 可初始化资料表并续建索引。查询也会补齐新增或修订内容的索引，读取结果按当前版本复核。`scripts/serein-import-materials.py` 仅用于从已有 Aru/Hindsight 部署一次性核对并迁入顾守编写的资料。使用历史部署的 `curated_pages` 读取当初入库所用的备份。运行时资料读写、搜索和注入都在 Serein 中完成。
 
-将本仓库的 `serein_gateway.py` 和 `systemd/98-serein-library.conf` 部署到聊天网关，并启用 Serein、证据桥和管理页服务。顾守的 MCP 入口为 `/serein/mcp`。旧部署使用 `scripts/serein-mcp-alias.py` 可让已经配好的 `/hindsight/mcp` 使用相同的 Aru 登录连接 Serein。新资料使用 `create_material`，修改已有资料先 `read_material` 读取全文和版本，再调用 `update_material`。整份替换和唯一原段落替换都检查版本。
+将本仓库的 `serein_gateway.py` 和 `systemd/98-serein-library.conf` 部署到聊天网关，并启用 Serein、证据桥和管理页服务。顾守的 MCP 入口为 `/serein/mcp`。旧部署使用 `scripts/serein-mcp-alias.py` 可让已经配好的 `/hindsight/mcp` 使用相同的 Aru 登录连接 Serein。信息卡使用 `writeInformationCard(subject, content)` 新建。修改已有卡时先用 Serein 的 `openMemorySource(id)` 读全文，再用同一个写卡工具传回 `cardId` 与改好的完整正文。长期资料用 `writeLongTermReference(title, content, summary?)` 新建，用 `updateLongTermReference(reference, content, title?, summary?)` 更新。读取结果中的更新标识绑定当时的版本，并发改动时请重新读取。已有的目录 ID 可持续用于阅读。更新部署时先用服务用户调用 `serein_library.store.setup` 更新资料表，再重启服务。
 
 ## 旧版 Hindsight 观察召回
 
